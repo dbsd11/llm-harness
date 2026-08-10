@@ -3,14 +3,14 @@ import time
 import uuid
 import json
 import threading
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any
 from datetime import datetime
 
 from database.repositories.scenario_repository import ScenarioRepository
 from database.models.scenario import Scenario
 from core.state_machine import ScenarioState, SCENARIO_STATE_MACHINE, TASK_TERMINAL_STATES
 from core.event_bus import event_bus
-from scenarios.base_scenario import BaseScenario, ScenarioContext
+from scenarios.base_scenario import BaseScenario
 from logger import logger
 
 
@@ -28,7 +28,6 @@ class ScenarioManager:
     def __init__(self):
         self.scenario_repo = ScenarioRepository()
         self.active_scenarios: Dict[str, BaseScenario] = {}
-        self.scenario_contexts: Dict[str, ScenarioContext] = {}
         self.lock = threading.Lock()
 
     def create_scenario(self, scenario_type: str, name: str, description: str = "",
@@ -570,176 +569,6 @@ class ScenarioManager:
         logger.info(f"Stopped scenario: {scenario_id}")
         return True
 
-    def get_scenario_status(self, scenario_id: str) -> Optional[Dict[str, Any]]:
-        """Get scenario status"""
-        scenario = self.scenario_repo.find_by_scenario_id(scenario_id)
-        if not scenario:
-            return None
-
-        return {
-            "scenario_id": scenario.scenario_id,
-            "scenario_type": scenario.scenario_type,
-            "name": scenario.name,
-            "state": scenario.state,
-            "config": json.loads(scenario.config) if scenario.config else {},
-            "created_at": scenario.created_at.isoformat() if scenario.created_at else None,
-            "started_at": scenario.started_at.isoformat() if scenario.started_at else None,
-            "completed_at": scenario.completed_at.isoformat() if scenario.completed_at else None,
-        }
-
-    def list_scenarios(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """List all scenarios"""
-        scenarios = self.scenario_repo.find_all(limit=limit)
-        return [
-            {
-                "scenario_id": s.scenario_id,
-                "scenario_type": s.scenario_type,
-                "name": s.name,
-                "state": s.state,
-                "created_at": s.created_at.isoformat() if s.created_at else None,
-            }
-            for s in scenarios
-        ]
-
-    def shutdown(self):
-        """Shutdown scenario manager"""
-        # Stop all active scenarios
-        with self.lock:
-            for scenario_id in list(self.active_scenarios.keys()):
-                self.stop_scenario(scenario_id)
-
-        logger.info("ScenarioManager shutdown")
-
 
 # Global scenario manager instance
 scenario_manager = ScenarioManager()
-
-
-def recover_orphans_on_startup() -> None:
-    """Mark in-flight scenarios/tasks orphaned by a platform restart as failed.
-
-    Scenario execution threads live in the Flask process; task execution lives
-    in the WS process. A platform restart kills both, so any scenario still
-    `running` and any task still `pending`/`running`/`waiting` has no live
-    runner and would otherwise stay "running" forever. This makes them visible
-    failures instead. Full scenario resume (checkpointing) is future work.
-
-    Idempotent: only touches non-terminal rows, so repeated restarts are safe.
-    """
-    from database.repositories.task_repository import TaskRepository
-
-    srepo = ScenarioRepository()
-    trepo = TaskRepository()
-
-    n_scenarios = 0
-    for s in srepo.find_by_state(ScenarioState.RUNNING.value):
-        srepo.mark_as_failed(s.scenario_id)
-        n_scenarios += 1
-
-    n_tasks = 0
-    for state in ("pending", "running", "waiting"):
-        for t in trepo.find_by_state(state):
-            trepo.mark_as_failed(t.task_id, "Orphaned by platform restart")
-            n_tasks += 1
-
-    if n_scenarios or n_tasks:
-        logger.info(f"Startup orphan recovery: marked {n_scenarios} scenario(s) "
-                    f"and {n_tasks} task(s) as failed")
-        event_bus.emit("recovery.orphans_marked", {
-            "scenarios": n_scenarios, "tasks": n_tasks,
-        })
-    else:
-        logger.info("Startup orphan recovery: no orphans found")
-
-
-# ── self-check ─────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    # ponytail: one runnable check — declared topology materializes to rows
-    import json as _json
-
-    created = []
-
-    class _StubRepo:
-        def create(self, agent):
-            created.append(agent)
-
-    cfg = {
-        "agent_roles": {
-            "scheduling_agent": {"role": "调度专家"},
-            "execution_agents": [
-                {"name": "数学家", "role": "数学专家", "server_id": "srv-1"},
-                {"name": "作家", "role": "写作专家"},
-            ],
-        }
-    }
-    sm = ScenarioManager()
-    sm.scenario_repo = None  # not used by _register_declared_agents
-    # inject stub repo into the method's import scope
-    import scenarios.scenario_manager as _self
-    _real_AgentRepository = _self.__dict__.get("AgentRepository")
-    # _register_declared_agents imports AgentRepository lazily inside the func;
-    # patch the module attribute used by the import.
-    import database.repositories.agent_repository as _arepo_mod
-    _orig = _arepo_mod.AgentRepository
-    _arepo_mod.AgentRepository = _StubRepo
-    try:
-        sm._register_declared_agents("sc-123", cfg)
-    finally:
-        _arepo_mod.AgentRepository = _orig
-
-    types = [a.agent_type for a in created]
-    assert types == ["scheduling", "execution", "execution"], f"rows: {types}"
-    sched_cfg = _json.loads(created[0].config)
-    assert created[0].name == "调度Agent" and sched_cfg["role"] == "调度专家"
-    exec1 = _json.loads(created[1].config)
-    assert created[1].name == "数学家" and exec1["role"] == "数学专家" \
-        and exec1["server_id"] == "srv-1"
-    assert created[2].name == "作家"
-    # empty agent_roles → still registers a scheduling agent with default role
-    created.clear()
-    _arepo_mod.AgentRepository = _StubRepo
-    try:
-        sm._register_declared_agents("sc-456", {})
-    finally:
-        _arepo_mod.AgentRepository = _orig
-    assert len(created) == 1 and created[0].agent_type == "scheduling" \
-        and _json.loads(created[0].config)["role"], "empty config fallback"
-
-    # recover_orphans_on_startup: running scenarios + non-terminal tasks -> failed
-    s_marked, t_marked = [], []
-
-    class _SRepo:
-        def find_by_state(self, state):
-            if state == "running":
-                class S: scenario_id = "sc-run"
-                return [S()]
-            return []
-        def mark_as_failed(self, sid): s_marked.append(sid)
-    class _TRepo:
-        def find_by_state(self, state):
-            if state == "running":
-                class T: task_id = "t-run"
-                return [T()]
-            if state == "pending":
-                class T: task_id = "t-pend"
-                return [T()]
-            return []
-        def mark_as_failed(self, tid, err): t_marked.append(tid)
-
-    _real_sr = ScenarioRepository
-    _real_tr = globals().get("TaskRepository")
-    globals()["ScenarioRepository"] = _SRepo
-    import scenarios.scenario_manager as _smmod
-    # recover_orphans_on_startup imports TaskRepository lazily inside the func
-    import database.repositories.task_repository as _tmod
-    _orig_tr = _tmod.TaskRepository
-    _tmod.TaskRepository = _TRepo
-    try:
-        recover_orphans_on_startup()
-    finally:
-        _tmod.TaskRepository = _orig_tr
-        globals()["ScenarioRepository"] = _real_sr
-    assert s_marked == ["sc-run"], f"running scenario should be failed: {s_marked}"
-    assert set(t_marked) == {"t-run", "t-pend"}, f"non-terminal tasks failed: {t_marked}"
-
-    print("scenario_manager self-check OK")

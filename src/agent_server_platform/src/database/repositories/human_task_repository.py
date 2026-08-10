@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 from typing import Optional, List
 from .base_repository import BaseRepository
-from ..models.human_task import HumanTask
+from ..models.local_human_task import HumanTask
 
 
 class HumanTaskRepository(BaseRepository[HumanTask]):
@@ -45,7 +45,7 @@ class HumanTaskRepository(BaseRepository[HumanTask]):
         """Mark a human task as submitted."""
         ph = self.placeholder
         sql = f"UPDATE {self.table_name} SET status={ph} WHERE task_id={ph}"
-        from database.connection import get_connection_manager
+        from database.local_connection import get_connection_manager
         cm = get_connection_manager()
         with cm.get_connection() as conn:
             cursor = conn.cursor()

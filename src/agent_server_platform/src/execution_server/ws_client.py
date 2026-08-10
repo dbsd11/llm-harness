@@ -6,7 +6,7 @@ import threading
 import websockets
 
 from logger import logger
-from core import ws_protocol as P
+from core import local_ws_protocol as P
 from .env_probe import probe_env
 
 
@@ -15,7 +15,7 @@ class WSClient:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        from common.utils.global_loop_util import get_random_work_loop
+        from common.utils.local_global_loop_util import get_random_work_loop
         self.loop = get_random_work_loop()
         self._ws = None
         self.task_runner = None  # set by run()

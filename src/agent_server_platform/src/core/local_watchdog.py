@@ -5,8 +5,8 @@ from datetime import datetime
 from typing import Optional
 
 from database.repositories.task_repository import TaskRepository
-from core.state_machine import TaskState
-from core.event_bus import event_bus
+from core.local_state_machine import TaskState
+from core.local_event_bus import event_bus
 from logger import logger
 
 

@@ -1,7 +1,7 @@
 # Scenario model
 from datetime import datetime
 from typing import Dict, Any, Type
-from .base import BaseModel
+from .local_base import BaseModel
 
 
 class Scenario(BaseModel):

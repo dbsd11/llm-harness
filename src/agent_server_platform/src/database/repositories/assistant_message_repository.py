@@ -3,8 +3,8 @@ from typing import List, Optional
 from datetime import datetime
 from logger import logger
 from .base_repository import BaseRepository
-from ..models.assistant_message import AssistantMessage
-from ..connection import get_connection_manager
+from ..models.local_assistant_message import AssistantMessage
+from ..local_connection import get_connection_manager
 
 
 class AssistantMessageRepository(BaseRepository[AssistantMessage]):

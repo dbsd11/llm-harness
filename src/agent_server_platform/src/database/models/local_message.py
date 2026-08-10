@@ -1,7 +1,7 @@
 # Message model - persisted agent-to-agent communication
 from datetime import datetime
 from typing import Dict, Any, Type
-from .base import BaseModel
+from .local_base import BaseModel
 
 
 class Message(BaseModel):

@@ -1,6 +1,6 @@
 # Assistant message model - 助手对话消息
 from datetime import datetime
-from .base import BaseModel
+from .local_base import BaseModel
 
 
 class AssistantMessage(BaseModel):

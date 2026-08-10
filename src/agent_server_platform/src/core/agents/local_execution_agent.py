@@ -2,9 +2,9 @@
 import json
 import subprocess
 from typing import Dict, Any, List, Optional
-from .base_agent import BaseAgent
-from core.llm_client import llm_client
-from core.event_bus import event_bus
+from .local_base_agent import BaseAgent
+from core.local_llm_client import llm_client
+from core.local_event_bus import event_bus
 from logger import logger
 
 _MAX_REACT_ITERATIONS = 10

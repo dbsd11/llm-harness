@@ -35,7 +35,7 @@ def register_user(username: str, email: str, password: str, **kwargs) -> bool:
             return False
 
         from datetime import datetime
-        from database.models.user import User
+        from database.models.local_user import User
 
         password_hash = hash_password(password)
 

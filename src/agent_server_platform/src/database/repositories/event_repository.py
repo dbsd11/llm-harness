@@ -2,7 +2,7 @@
 from typing import List, Optional
 from datetime import datetime
 from .base_repository import BaseRepository
-from ..models.event import Event
+from ..models.local_event import Event
 
 
 class EventRepository(BaseRepository[Event]):
@@ -14,7 +14,7 @@ class EventRepository(BaseRepository[Event]):
 
     def _ensure_columns(self):
         """Migration: add trace_id and metadata columns if missing."""
-        from database.connection import get_connection_manager
+        from database.local_connection import get_connection_manager
         cols_to_add = {"trace_id": "TEXT", "metadata": "TEXT"}
         try:
             conn_mgr = get_connection_manager()
@@ -64,7 +64,7 @@ class EventRepository(BaseRepository[Event]):
         placeholder = '%s' if self.db_engine == 'mysql' else '?'
         sql = f"SELECT * FROM {self.table_name} WHERE event_type LIKE {placeholder} ORDER BY timestamp DESC LIMIT {placeholder}"
 
-        from ..connection import get_connection_manager
+        from ..local_connection import get_connection_manager
         connection_manager = get_connection_manager()
         with connection_manager.get_connection() as conn:
             cursor = conn.cursor()

@@ -14,7 +14,7 @@ import ssl
 from datetime import datetime
 
 from logger import logger
-from core import ws_protocol as P
+from core import local_ws_protocol as P
 from database.repositories.human_task_repository import HumanTaskRepository
 
 
@@ -55,7 +55,7 @@ class HumanAgentClient:
         self._running = True
         self._repo.create_table_if_not_exists()
 
-        from common.utils.global_loop_util import get_random_work_loop
+        from common.utils.local_global_loop_util import get_random_work_loop
         self._loop = get_random_work_loop()
         self._task = asyncio.run_coroutine_threadsafe(self._main(), self._loop)
         logger.info(f"HumanAgentClient started: server_id={self._server_id} "
@@ -192,7 +192,7 @@ class HumanAgentClient:
                 # DB write is sync I/O; run in dedicated DB thread pool to
                 # avoid blocking the WS event loop AND avoid competing with
                 # Gradio's default thread pool (/theme.css sync routes).
-                from common.utils.global_loop_util import run_in_db_thread
+                from common.utils.local_global_loop_util import run_in_db_thread
                 await run_in_db_thread(
                     self._persist_task, task_id, goal, context, parent_task_id
                 )

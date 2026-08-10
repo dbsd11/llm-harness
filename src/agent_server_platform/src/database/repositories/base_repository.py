@@ -3,8 +3,8 @@ import os
 from typing import Dict, Any, List, Optional, Type, TypeVar, Generic
 from datetime import datetime
 
-from ..connection import get_connection_manager
-from ..models.base import BaseModel
+from ..local_connection import get_connection_manager
+from ..models.local_base import BaseModel
 
 T = TypeVar('T', bound=BaseModel)
 

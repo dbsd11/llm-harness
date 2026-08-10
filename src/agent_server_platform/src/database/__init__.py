@@ -2,18 +2,16 @@
 import logging
 from typing import List, Type
 
-from .connection import get_connection_manager
-from .models.base import BaseModel
-from .models.user import User
-from .models.agent import Agent
-from .models.task import Task
-from .models.scenario import Scenario
-from .models.event import Event
-from .models.message import Message
-from .models.consumer_offset import ConsumerOffset
-from .models.execution_server import ExecutionServer
-from .models.assistant_message import AssistantMessage
-from .models.human_task import HumanTask
+from .local_connection import get_connection_manager
+from .models.local_base import BaseModel
+from .models.local_user import User
+from .models.local_agent import Agent
+from .models.local_task import Task
+from .models.local_scenario import Scenario
+from .models.local_event import Event
+from .models.local_message import Message
+from .models.local_assistant_message import AssistantMessage
+from .models.local_human_task import HumanTask
 
 from .repositories.base_repository import BaseRepository
 
@@ -31,8 +29,6 @@ def init_database():
             Scenario,
             Event,
             Message,
-            ConsumerOffset,
-            ExecutionServer,
             AssistantMessage,
             HumanTask,
         ]
@@ -52,10 +48,6 @@ def init_database():
         event_repo = EventRepository()
         event_repo._ensure_columns()
         logger.info("Event table migration complete")
-
-        from .repositories.execution_server_repository import ExecutionServerRepository
-        ExecutionServerRepository()._ensure_columns()
-        logger.info("ExecutionServer table migration complete")
 
         from .repositories.assistant_message_repository import AssistantMessageRepository
         AssistantMessageRepository()._ensure_columns()

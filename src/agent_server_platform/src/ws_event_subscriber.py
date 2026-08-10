@@ -33,7 +33,7 @@ class WSEventSubscriber:
             return
 
         self._running = True
-        from common.utils.global_loop_util import get_random_work_loop
+        from common.utils.local_global_loop_util import get_random_work_loop
         self._loop = get_random_work_loop()
         self._task = asyncio.run_coroutine_threadsafe(self._subscribe_loop(), self._loop)
         logger.info(f"WS 事件订阅已启动: {self.ws_url}")
@@ -92,7 +92,7 @@ class WSEventSubscriber:
 
             # Write ALL events to local events table (platform's only persistent store)
             import json as _json
-            from common.utils.global_loop_util import run_in_db_thread
+            from common.utils.local_global_loop_util import run_in_db_thread
             await run_in_db_thread(
                 self.event_repo.create_event,
                 event_type,
@@ -128,7 +128,7 @@ class WSEventSubscriber:
         # 避免阻塞订阅器的 event loop。同时不与 uvicorn 默认线程池竞争（Gradio 的
         # /theme.css 等 sync 路由也走默认线程池）。
         # _subscribe_loop 逐条 await，故写库天然串行，无需额外加锁。
-        from common.utils.global_loop_util import run_in_db_thread
+        from common.utils.local_global_loop_util import run_in_db_thread
         await run_in_db_thread(self._persist_task_result, task_id, result, success)
         if success:
             logger.info(f"任务完成: {task_id}")
@@ -143,7 +143,7 @@ class WSEventSubscriber:
         if not task_id or not server_id:
             logger.warning(f"task_dispatched event missing task_id or server_id: {payload}")
             return
-        from common.utils.global_loop_util import run_in_db_thread
+        from common.utils.local_global_loop_util import run_in_db_thread
         await run_in_db_thread(self._persist_task_dispatched, task_id, server_id,
                                 payload.get("goal", ""),
                                 payload.get("context", {}),
@@ -175,7 +175,7 @@ class WSEventSubscriber:
         # and advance to the next wave. Without this, collect_replies times out
         # and dependent tasks stay pending forever.
         from database.repositories.message_repository import MessageRepository
-        from database.models.message import Message
+        from database.models.local_message import Message
         from datetime import datetime
         msg_repo = MessageRepository()
         task = self.task_repo.find_by_task_id(task_id)

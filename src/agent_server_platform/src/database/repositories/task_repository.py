@@ -3,7 +3,7 @@ from typing import Optional, List
 from datetime import datetime
 from logger import logger
 from .base_repository import BaseRepository
-from ..models.task import Task
+from ..models.local_task import Task
 
 
 class TaskRepository(BaseRepository[Task]):
@@ -20,7 +20,7 @@ class TaskRepository(BaseRepository[Task]):
         ponytail: ALTER TABLE ADD COLUMN with error suppression.
         No-op if columns already exist or table doesn't exist yet.
         """
-        from database.connection import get_connection_manager
+        from database.local_connection import get_connection_manager
         cols_to_add = {
             "topic_id": "TEXT",
             "idempotency_key": "TEXT",
@@ -228,7 +228,7 @@ class TaskRepository(BaseRepository[Task]):
         task_id. Used for sub-tree re-derivation (manual_acceptance)."""
         if not task_id:
             return []
-        from database.connection import get_connection_manager
+        from database.local_connection import get_connection_manager
         # depends_on is a JSON array string like ["id1","id2"]; match the quoted id.
         pattern = f'%"{task_id}"%'
         sql = (f"SELECT * FROM {self.table_name} "

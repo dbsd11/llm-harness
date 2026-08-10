@@ -2,8 +2,8 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from core.agents.execution_agent import ExecutionAgent
-from core import ws_protocol as P
+from core.agents.local_execution_agent import ExecutionAgent
+from core import local_ws_protocol as P
 from logger import logger
 
 

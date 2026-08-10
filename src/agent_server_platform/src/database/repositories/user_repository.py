@@ -4,9 +4,9 @@ from datetime import datetime
 import os
 from logger import logger
 
-from ..models.user import User
+from ..models.local_user import User
 from .base_repository import BaseRepository
-from ..connection import get_connection_manager
+from ..local_connection import get_connection_manager
 
 class UserRepository(BaseRepository[User]):
     """用户仓储"""

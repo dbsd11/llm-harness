@@ -15,7 +15,7 @@ import multiprocessing
 
 from database import init_database, close_database
 from logger import logger
-from core.watchdog import watchdog
+from core.local_watchdog import watchdog
 
 
 def signal_handler(signum, frame):
@@ -102,7 +102,7 @@ def main():
     # Reclaim orphans from a prior crash/restart: mark in-flight scenarios +
     # tasks failed so nothing stays "running" forever (no live runner exists
     # for them after a restart).
-    from scenarios.scenario_manager import recover_orphans_on_startup
+    from scenarios.local_scenario_manager import recover_orphans_on_startup
     recover_orphans_on_startup()
 
     # Register signal handlers

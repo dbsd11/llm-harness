@@ -1,7 +1,7 @@
 # HumanTask model — tracks tasks dispatched to human agents via WS event bridge
 from datetime import datetime
 from typing import Dict, Type
-from .base import BaseModel
+from .local_base import BaseModel
 
 
 class HumanTask(BaseModel):

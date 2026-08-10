@@ -10,10 +10,10 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from core.llm_client import llm_client
+from core.local_llm_client import llm_client
 from database.repositories.scenario_repository import ScenarioRepository
 from pages.scenario_dashboard.export_html import build_message_history
-from scenarios.scenario_manager import scenario_manager
+from scenarios.local_scenario_manager import scenario_manager
 from logger import logger
 
 

@@ -1,7 +1,7 @@
 # Execution Servers page - 通过 REST API 查询远程 WebSocket Server 的执行服务器信息
 import json
 import gradio as gr
-from core.websocket_api_client import list_servers, get_server, delete_server, cleanup_offline
+from core.local_websocket_api_client import list_servers, get_server, delete_server, cleanup_offline
 
 
 # `source` -> UI label. Centralized so the list + detail stay consistent.

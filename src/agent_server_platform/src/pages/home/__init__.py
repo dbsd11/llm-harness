@@ -9,7 +9,7 @@ import gradio as gr
 from api_client import api_client
 from database.repositories.assistant_message_repository import AssistantMessageRepository
 from pages.home.compression import compress_if_needed
-from core.llm_client import llm_client
+from core.local_llm_client import llm_client
 
 # Pre-fetch assistant message rendering
 ASSISTANT_EMPTY_PREVIEW = "暂无草稿。通过对话描述想创建的场景，草稿会在此预览，确认无误后再保存。"

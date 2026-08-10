@@ -2,7 +2,7 @@
 from datetime import datetime
 from typing import Dict, Any
 
-from .base import BaseModel
+from .local_base import BaseModel
 
 class User(BaseModel):
     """用户模型"""
