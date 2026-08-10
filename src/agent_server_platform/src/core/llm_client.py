@@ -187,6 +187,13 @@ class LLMClient:
         else:
             env_section = ""
 
+        # Build planning insights section from ReAct planning phase.
+        planning_insights = context.get("planning_insights") or ""
+        if planning_insights:
+            planning_section = f"\n规划建议（来自系统状态分析）：\n{planning_insights}\n请参考以上建议进行任务分解。\n"
+        else:
+            planning_section = ""
+
         prompt = f"""你是一个任务分解专家。请将以下目标分解为多个子任务，每个子任务由一个专门角色的智能代理来完成。
 
 目标：{goal}
@@ -211,6 +218,7 @@ class LLMClient:
    - 无依赖关系的子任务用空数组，它们会并行执行
 {role_constraint}
 {env_section}
+{planning_section}
 示例：
 如果目标是"编写代码计算1+1并执行它"，应该分解为：
 - 子任务1: "编写计算1+1的Python代码"
@@ -431,6 +439,13 @@ class LLMClient:
         else:
             env_section = ""
 
+        # Build planning insights section from ReAct planning phase.
+        planning_insights = context.get("planning_insights") or ""
+        if planning_insights:
+            planning_section = f"\n规划建议（来自系统状态分析）：\n{planning_insights}\n请参考以上建议进行修正任务分解。\n"
+        else:
+            planning_section = ""
+
         prompt = f"""你是一个任务修正专家。一个任务被人工审核拒绝，需要根据审核反馈重新生成修正方案。
 
 ## 被拒绝的任务
@@ -450,6 +465,7 @@ class LLMClient:
 5. 根任务的 depends_on 应该是被拒绝任务的原始 depends_on（已完成的前序任务）
 {role_constraint}
 {env_section}
+{planning_section}
 
 返回格式（严格遵循）：
 ```json

@@ -129,6 +129,12 @@ class SchedulingAgent(BaseAgent):
                 if env_summary:
                     context = dict(context)
                     context["execution_env"] = env_summary
+                # ReAct planning phase: LLM uses tools to gather system state
+                planning_insights = self._planning_react_loop(goal, context, scenario_id)
+                if planning_insights:
+                    context = dict(context)
+                    context["planning_insights"] = planning_insights
+                    logger.info(f"Planning insights collected ({len(planning_insights)} chars)")
                 logger.info(f"Starting goal decomposition for task {task_id}")
                 subtasks = self._decompose_goal(goal, context)
                 subtasks = self._normalize_subtasks(subtasks)
@@ -568,6 +574,99 @@ class SchedulingAgent(BaseAgent):
         except Exception as e:
             logger.warning(f"Failed to collect execution server env_info: {e}")
             return []
+
+    _MAX_PLANNING_ITERATIONS = 5
+
+    def _planning_react_loop(self, goal: str, context: Dict[str, Any],
+                              scenario_id: Optional[str] = None) -> Optional[str]:
+        """Run a bounded ReAct loop to gather context via tools before decomposition.
+
+        The LLM can call registered tools (list servers, query tasks, etc.) to
+        understand the current system state. Returns the LLM's planning summary
+        string, or None if planning is skipped (no tools / LLM unavailable).
+
+        Args:
+            goal: The user's goal description
+            context: Goal context (priority, timeout, agent_roles, etc.)
+            scenario_id: Optional scenario ID for context
+
+        Returns:
+            Planning insights string, or None
+        """
+        tools = self.tools.to_openai_tools()
+        if not tools:
+            logger.debug("No tools registered, skipping planning phase")
+            return None
+
+        if not llm_client.client:
+            logger.debug("LLM not configured, skipping planning phase")
+            return None
+
+        system_msg = (
+            "你是一个任务规划助手。在分解用户目标之前，你可以使用工具查询当前系统状态，"
+            "包括可用的执行服务器、已有任务、服务器环境信息等。\n"
+            "请根据需要调用工具收集信息，然后给出一段简明的规划建议，帮助后续的任务分解。\n"
+            "如果你认为已有信息足够，可以直接输出规划建议而不调用工具。"
+        )
+
+        user_parts = [f"用户目标：{goal}"]
+        if scenario_id:
+            user_parts.append(f"场景 ID：{scenario_id}")
+        priority = context.get("priority", 0)
+        timeout = context.get("timeout_seconds", 3600)
+        user_parts.append(f"优先级：{priority}，超时：{timeout}s")
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": "\n".join(user_parts)},
+        ]
+
+        for iteration in range(self._MAX_PLANNING_ITERATIONS):
+            try:
+                response = llm_client.chat_with_tools(messages, tools, temperature=0.3)
+            except Exception as e:
+                logger.warning(f"Planning ReAct LLM call failed at iteration {iteration}: {e}")
+                return None
+
+            if response is None:
+                logger.warning("Planning ReAct: LLM returned empty response")
+                return None
+
+            content = response.get("content", "")
+            tool_calls = response.get("tool_calls")
+
+            # Build assistant message for history
+            assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
+
+            if not tool_calls:
+                logger.info(f"Planning ReAct completed after {iteration + 1} iteration(s)")
+                return content or None
+
+            for tc in tool_calls:
+                fn_name = tc["function"]["name"]
+                try:
+                    fn_args = json.loads(tc["function"]["arguments"])
+                except json.JSONDecodeError:
+                    fn_args = {}
+
+                try:
+                    tool_result = self.tools.call(fn_name, **fn_args)
+                    tool_output = json.dumps(tool_result, ensure_ascii=False, default=str)
+                except Exception as e:
+                    tool_output = json.dumps({"error": str(e)})
+                    logger.warning(f"Planning tool {fn_name} failed: {e}")
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": tool_output,
+                })
+
+        logger.warning(f"Planning ReAct hit max iterations ({self._MAX_PLANNING_ITERATIONS})")
+        return content or None
 
     def _decompose_goal(self, goal: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
         """

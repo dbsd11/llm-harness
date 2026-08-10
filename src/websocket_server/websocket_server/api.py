@@ -200,16 +200,18 @@ def register_routes(app: web.Application, ws_server) -> None:
     app.router.add_delete("/api/servers/{server_id}", delete_server)
     app.router.add_post("/api/tasks/dispatch", dispatch_task)
 
-    # Register scenario, task, chat, event, agent routes
+    # Register scenario, task, chat, event, agent, tool routes
     from .api_routes_scenario import register_scenario_routes
     from .api_routes_task import register_task_routes
     from .api_routes_chat import register_chat_routes
     from .api_routes_event import register_event_routes
     from .api_routes_agent import register_agent_routes
+    from .api_routes_tool import register_tool_routes
 
     register_scenario_routes(app)
     register_task_routes(app)
     register_chat_routes(app)
     register_event_routes(app)
     register_agent_routes(app)
+    register_tool_routes(app)
     logger.info("All API routes registered")
