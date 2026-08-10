@@ -131,7 +131,11 @@ class ExecutionAgent(BaseAgent):
             f"{self.system_prompt}\n\n"
             "你可以通过 run_bash 工具在服务器 shell 中执行命令。"
             "当任务需要运行命令（python 脚本、curl、文件操作等）时，请使用该工具。"
-            "观察命令输出后继续推理，直到完成任务并给出最终回答。"
+            "观察命令输出后继续推理，直到完成任务并给出最终回答。\n\n"
+            "【重要】文件输出约束：\n"
+            "- /data 是持久化数据目录，任务中生成的所有文件（文本、图片、音频、视频、PDF 等多模态文件）必须保存到 /data 目录下。\n"
+            "- 不要将生成的文件保存到 /tmp、/app 或其他临时目录，这些目录在容器重启后会丢失。\n"
+            "- 在最终回答中，请列出所有生成文件的完整路径（如 /data/report.pdf、/data/chart.png），以便后续任务或用户可以找到它们。"
         )
         if upstream:
             system_msg += "\n\n前序任务的输出：\n" + "\n---\n".join(upstream)
