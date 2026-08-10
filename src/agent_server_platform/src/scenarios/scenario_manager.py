@@ -1,4 +1,5 @@
 # Scenario Manager - scenario lifecycle management
+import time
 import uuid
 import json
 import threading
@@ -229,12 +230,45 @@ class ScenarioManager:
                 cfg["server_id"] = ag["server_id"]
             _create("execution", name, cfg)
 
+    def _wait_for_scenario_tasks(self, scenario_id: str, timeout: int = 60) -> bool:
+        """Wait until all tasks for a scenario reach terminal states.
+
+        Ensures subtask DB state is persisted before the scenario lifecycle
+        ends. Without this, collect_replies() may return a reply message
+        before finalize_task() finishes updating the subtask row, causing
+        the scenario to complete while a subtask still shows 'running'.
+
+        Returns True if all tasks are terminal, False on timeout.
+        """
+        from database.repositories.task_repository import TaskRepository
+
+        task_repo = TaskRepository()
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            tasks = task_repo.find_by_scenario_id(scenario_id)
+            non_terminal = [t for t in tasks if t.state not in TASK_TERMINAL_STATES]
+            if not non_terminal:
+                return True
+            time.sleep(0.5)
+
+        remaining = [t.task_id for t in task_repo.find_by_scenario_id(scenario_id)
+                     if t.state not in TASK_TERMINAL_STATES]
+        logger.warning(f"Scenario {scenario_id}: {len(remaining)} task(s) still "
+                       f"non-terminal after {timeout}s wait: {remaining}")
+        return False
+
     def _execute_scenario(self, scenario_id: str, scenario: BaseScenario,
                          config: Dict[str, Any], trace_id: str = None):
         """Execute scenario in background thread with trace propagation"""
         try:
             # Execute scenario
             result = scenario.start(config)
+
+            # Wait for all subtasks to reach terminal state in DB before
+            # marking the scenario done. collect_replies() may return a reply
+            # message before finalize_task() finishes updating the subtask row.
+            self._wait_for_scenario_tasks(scenario_id)
 
             if config.get("manual_acceptance"):
                 # Manual acceptance: cycle 1 paused or completed-with-no-tasks.

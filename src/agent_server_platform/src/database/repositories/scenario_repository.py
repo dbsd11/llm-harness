@@ -30,6 +30,8 @@ class ScenarioRepository(BaseRepository[Scenario]):
         if not scenario:
             return False
         scenario.state = new_state
+        if new_state == "running" and not scenario.started_at:
+            scenario.started_at = datetime.now()
         scenario.updated_at = datetime.now()
         return self.update(scenario)
 
