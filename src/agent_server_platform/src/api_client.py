@@ -27,9 +27,11 @@ class APIClient:
             logger.error(f"API GET {path} failed: {e}")
             return {"success": False, "error": str(e)}
 
-    def _post(self, path: str, data: Dict[str, Any] = None) -> dict:
+    def _post(self, path: str, data: Dict[str, Any] = None,
+              timeout: int = 180) -> dict:
         try:
-            resp = requests.post(f"{self.base_url}{path}", json=data or {}, timeout=30, verify=False)
+            resp = requests.post(f"{self.base_url}{path}", json=data or {},
+                                 timeout=timeout, verify=False)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
