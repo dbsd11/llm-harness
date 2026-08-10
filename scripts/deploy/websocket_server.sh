@@ -50,7 +50,7 @@ SRC_DIR="$REPO_ROOT/src/websocket_server"
 DOCKERFILE="$REPO_ROOT/scripts/build/websocket_server/Dockerfile"
 ENV_FILE="/tmp/ws_container.env"
 # cert bind-mount + TLS env, applied to every docker run (incl. rollback)
-CERT_RUN_ARGS="-v $REMOTE_CERT_DIR:/certs:ro -e WS_SSL_CERT=/certs/server.pem -e WS_SSL_KEY=/certs/server.key"
+CERT_RUN_ARGS="-v $REMOTE_CERT_DIR:/certs:ro -e WS_SSL_CERT=/certs/server.pem -e WS_SSL_KEY=/certs/server.key -v /agent-data-files/schedule-agent:/data -e DB_NAME=/data/websocket_server.db"
 
 # expect wrappers for SSH/SCP with password auth
 ssh_pw() {
@@ -107,7 +107,7 @@ scp_pw "$CERT_DIR/server.pem" "$REMOTE_CERT_DIR/server.pem"
 scp_pw "$CERT_DIR/server.key" "$REMOTE_CERT_DIR/server.key"
 
 echo "==> [5/7] Remote docker build + run (TLS, env preserved via --env-file)"
-ssh_pw "mkdir -p $REMOTE_DIR && tar -xzf /tmp/ws_server_deploy.tgz -C $REMOTE_DIR && rm -f /tmp/ws_server_deploy.tgz && sudo docker build -t $IMAGE $REMOTE_DIR && if test -f $ENV_FILE; then sudo docker run -d --name $CONTAINER --network host $CERT_RUN_ARGS --env-file $ENV_FILE $IMAGE; else sudo docker run -d --name $CONTAINER --network host $CERT_RUN_ARGS -e WS_HOST=0.0.0.0 -e WS_PORT=8765 $IMAGE; fi && sleep 3 && sudo docker ps --filter name=$CONTAINER"
+ssh_pw "mkdir -p $REMOTE_DIR && tar -xzf /tmp/ws_server_deploy.tgz -C $REMOTE_DIR && rm -f /tmp/ws_server_deploy.tgz && sudo docker build -t $IMAGE $REMOTE_DIR && sudo mkdir -p /agent-data-files/schedule-agent && if test -f $ENV_FILE; then sudo docker run -d --name $CONTAINER --network host $CERT_RUN_ARGS --env-file $ENV_FILE $IMAGE; else sudo docker run -d --name $CONTAINER --network host $CERT_RUN_ARGS -e WS_HOST=0.0.0.0 -e WS_PORT=8765 $IMAGE; fi && sleep 3 && sudo docker ps --filter name=$CONTAINER"
 
 echo "==> [6/7] Health check (https, -k self-signed) + status"
 ssh_pw "sudo docker inspect --format '{{.State.Status}}' $CONTAINER 2>/dev/null | grep -qx running || { echo '!!! container not running, last logs:'; sudo docker logs --tail 50 $CONTAINER 2>&1; exit 1; }; curl -ksf https://localhost:8765/api/health && echo ' health=OK' || { echo '!!! health check failed, logs:'; sudo docker logs --tail 50 $CONTAINER 2>&1; exit 1; }"

@@ -81,11 +81,14 @@ class SandboxManager:
             "EVENT_PERSIST_DISABLED": "1",
         }
 
-        # Build docker run command
+        # Build docker run command with data volume mount
         env_args = " ".join([f'-e {k}="{v}"' for k, v in env_vars.items()])
+        host_data_dir = f"/agent-data-files/{server_id}"
         docker_cmd = (
+            f"mkdir -p {host_data_dir} && "
             f"docker run -d "
             f"--name {container_name} "
+            f"-v {host_data_dir}:/data "
             f"{env_args} "
             f"{image}"
         )
