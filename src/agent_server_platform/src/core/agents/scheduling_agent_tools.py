@@ -1,4 +1,5 @@
 # Scheduling Agent Tools - tools for execution server management
+import json
 from core.agents.tool_registry import tool_registry
 from core.sandbox_manager import SandboxManager
 from database.repositories.execution_server_repository import ExecutionServerRepository
@@ -40,6 +41,7 @@ def list_execution_servers() -> dict:
                 "running_count": s.running_count,
                 "source": s.source,
                 "last_heartbeat": s.last_heartbeat.isoformat() if s.last_heartbeat else None,
+                "env_info": json.loads(s.env_info) if s.env_info and s.env_info != "{}" else {},
             }
             for s in servers
         ],

@@ -74,6 +74,65 @@ class LLMClient:
             logger.error(f"LLM call failed after {elapsed_time:.2f}s: {str(e)}")
             return None
 
+    def chat_with_tools(self, messages: List[Dict], tools: List[Dict],
+                        temperature: float = 0.7) -> Optional[Dict[str, Any]]:
+        """Send a chat request with tool definitions (OpenAI function calling).
+
+        Returns the raw assistant message dict with 'content' and optional
+        'tool_calls'.  Returns None on failure.
+
+        Args:
+            messages: conversation messages (system / user / assistant / tool)
+            tools: OpenAI-format tool definitions
+            temperature: sampling temperature
+        """
+        import time
+
+        if not self.client:
+            logger.error("LLM client not initialized")
+            return None
+
+        try:
+            start_time = time.time()
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=self.max_tokens,
+                extra_body={"enable_thinking": self.enable_thinking} if self.enable_thinking else None
+            )
+            elapsed_time = time.time() - start_time
+
+            if completion.choices:
+                msg = completion.choices[0].message
+                result = {"content": msg.content or ""}
+                if msg.tool_calls:
+                    result["tool_calls"] = [
+                        {
+                            "id": tc.id,
+                            "type": tc.type,
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in msg.tool_calls
+                    ]
+                logger.info(
+                    f"chat_with_tools response in {elapsed_time:.2f}s, "
+                    f"tool_calls: {len(result.get('tool_calls', []))}"
+                )
+                return result
+            else:
+                logger.warning(f"chat_with_tools empty response after {elapsed_time:.2f}s")
+                return None
+
+        except Exception as e:
+            elapsed_time = time.time() - start_time if 'start_time' in locals() else 0
+            logger.error(f"chat_with_tools failed after {elapsed_time:.2f}s: {e}")
+            return None
+
     def decompose_goal(self, goal: str, context: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         """
         使用大模型智能分解目标为子任务

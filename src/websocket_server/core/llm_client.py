@@ -103,6 +103,31 @@ class LLMClient:
         else:
             role_constraint = ""
 
+        # Build execution environment section from connected servers' env_info.
+        execution_env = context.get("execution_env") or []
+        if execution_env:
+            env_lines = []
+            for srv in execution_env:
+                srv_name = srv.get("name", srv.get("server_id", "unknown"))
+                env = srv.get("env_info", {})
+                host = env.get("host", {})
+                cmds = env.get("commands", {})
+                available = [c for c, ok in cmds.items() if ok]
+                host_desc = host.get("os", "")
+                if host.get("hostname"):
+                    host_desc = f"{host['hostname']} ({host_desc})" if host_desc else host.get("hostname", "")
+                env_lines.append(
+                    f"   - 服务器 \"{srv_name}\": {host_desc}"
+                    f"\n     可用命令: {', '.join(available) if available else '无'}"
+                )
+            env_section = (
+                "\n可用执行环境信息：\n"
+                + "\n".join(env_lines)
+                + "\n请根据各服务器的可用命令来合理安排子任务，避免给不具备相应工具的环境分配无法执行的任务。\n"
+            )
+        else:
+            env_section = ""
+
         prompt = f"""你是一个任务分解专家。请将以下目标分解为多个子任务，每个子任务由一个专门角色的智能代理来完成。
 
 目标：{goal}
@@ -126,6 +151,7 @@ class LLMClient:
    - 若子任务 B 需要子任务 A 的结果才能执行，则 B 的 depends_on 包含 "A 的 id"
    - 无依赖关系的子任务用空数组，它们会并行执行
 {role_constraint}
+{env_section}
 
 示例：
 如果目标是"编写代码计算1+1并执行它"，应该分解为：
@@ -322,6 +348,31 @@ class LLMClient:
         else:
             role_constraint = ""
 
+        # Build execution environment section (same as decompose_goal).
+        execution_env = context.get("execution_env") or []
+        if execution_env:
+            env_lines = []
+            for srv in execution_env:
+                srv_name = srv.get("name", srv.get("server_id", "unknown"))
+                env = srv.get("env_info", {})
+                host = env.get("host", {})
+                cmds = env.get("commands", {})
+                available = [c for c, ok in cmds.items() if ok]
+                host_desc = host.get("os", "")
+                if host.get("hostname"):
+                    host_desc = f"{host['hostname']} ({host_desc})" if host_desc else host.get("hostname", "")
+                env_lines.append(
+                    f"   - 服务器 \"{srv_name}\": {host_desc}"
+                    f"\n     可用命令: {', '.join(available) if available else '无'}"
+                )
+            env_section = (
+                "\n可用执行环境信息：\n"
+                + "\n".join(env_lines)
+                + "\n请根据各服务器的可用命令来合理安排修正任务，避免给不具备相应工具的环境分配无法执行的任务。\n"
+            )
+        else:
+            env_section = ""
+
         prompt = f"""你是一个任务修正专家。一个任务被人工审核拒绝，需要根据审核反馈重新生成修正方案。
 
 ## 被拒绝的任务
@@ -340,6 +391,7 @@ class LLMClient:
 4. 每个子任务必须有唯一 id（如 "t1", "t2"）和 depends_on 数组
 5. 根任务的 depends_on 应该是被拒绝任务的原始 depends_on（已完成的前序任务）
 {role_constraint}
+{env_section}
 
 返回格式（严格遵循）：
 ```json

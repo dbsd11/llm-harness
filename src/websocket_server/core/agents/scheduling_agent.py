@@ -105,6 +105,10 @@ class SchedulingAgent(BaseAgent):
             if resume_cycle and scenario_id:
                 # Resume mode: load existing tasks, derive corrective tasks
                 topic_id = str(uuid.uuid4())
+                env_summary = self._collect_env_info()
+                if env_summary:
+                    context = dict(context)
+                    context["execution_env"] = env_summary
                 subtasks, local_id_to_task_id, created_by_id, subtask_ids = \
                     self._build_resume_plan(scenario_id, task_id, topic_id, context)
                 if not subtasks:
@@ -119,6 +123,12 @@ class SchedulingAgent(BaseAgent):
             else:
                 # Fresh cycle: decompose goal
                 topic_id = str(uuid.uuid4())
+                # Collect execution server environment info so the LLM can
+                # make informed task assignments based on available tools/commands.
+                env_summary = self._collect_env_info()
+                if env_summary:
+                    context = dict(context)
+                    context["execution_env"] = env_summary
                 logger.info(f"Starting goal decomposition for task {task_id}")
                 subtasks = self._decompose_goal(goal, context)
                 subtasks = self._normalize_subtasks(subtasks)
@@ -529,6 +539,35 @@ class SchedulingAgent(BaseAgent):
                     })
 
         return subtasks, local_id_to_task_id, created_by_id, subtask_ids
+
+    def _collect_env_info(self) -> List[Dict[str, Any]]:
+        """Query connected execution servers and return their env_info summaries.
+
+        Returns a list of {server_id, name, env_info} for each connected server.
+        Returns [] when no servers are connected or on error.
+        """
+        try:
+            from database.repositories.execution_server_repository import ExecutionServerRepository
+            servers = ExecutionServerRepository().list_all()
+            result = []
+            for s in servers:
+                if not s.connected:
+                    continue
+                env_raw = s.env_info
+                if not env_raw or env_raw == "{}":
+                    continue
+                env = json.loads(env_raw) if isinstance(env_raw, str) else env_raw
+                result.append({
+                    "server_id": s.server_id,
+                    "name": s.name,
+                    "env_info": env,
+                })
+            if result:
+                logger.info(f"Collected env_info from {len(result)} connected execution server(s)")
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to collect execution server env_info: {e}")
+            return []
 
     def _decompose_goal(self, goal: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
