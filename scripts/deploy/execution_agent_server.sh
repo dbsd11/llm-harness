@@ -45,7 +45,7 @@ if [[ -f "$LOCAL_ENV" ]]; then
   source "$LOCAL_ENV"
   set +a
   # Restore explicit overrides
-  for sv in "${_saved_vars[@]}"; do
+  for sv in ${_saved_vars[@]+"${_saved_vars[@]}"}; do
     export "$sv"
   done
   echo "    loaded local env: $LOCAL_ENV"
