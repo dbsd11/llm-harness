@@ -1,0 +1,77 @@
+# ── Secrets / environment ────────────────────────────────────────────────────
+.env
+.env.local
+.env.production
+.env.*.local
+!.env.example
+deploy/
+
+# ── Databases (dev SQLite data) ──────────────────────────────────────────────
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+.installed.cfg
+MANIFEST
+parts/
+sdist/
+var/
+wheels/
+lib/
+lib64/
+
+# ── Virtual environments ─────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── Testing / coverage ───────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ── IDE / editor ─────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.qoder/
+*.swp
+*.swo
+*~
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Tool workspaces ──────────────────────────────────────────────────────────
+.hiclaw-workspace/
+
+# ── Node (if any frontend tooling is added later) ────────────────────────────
+node_modules/

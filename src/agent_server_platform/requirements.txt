@@ -1,0 +1,29 @@
+# Core dependencies
+gradio>=5.0.0,<6.0.0
+flask>=3.0.0
+flask-restx>=1.3.0
+python-dotenv>=1.0.0
+
+# Database
+dbutils>=3.0.0
+pymysql>=1.1.0
+
+# Async
+asyncio
+
+# WebSocket (backend <-> execution-agent-server)
+websockets>=12.0
+
+# Logging
+colorlog>=6.8.0
+
+# Security
+bcrypt>=4.0.0
+
+# Utilities
+requests>=2.31.0
+openai>=1.0.0
+
+# Sandbox management (SSH to remote Docker host)
+paramiko>=3.4.0
+aiosqlite>=0.20.0
