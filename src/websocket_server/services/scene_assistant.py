@@ -195,7 +195,13 @@ def render_preview(spec: Optional[Dict[str, Any]]) -> str:
         lines.append(f"- **调度 Agent**：{sched}")
     for a in roles.get("execution_agents") or []:
         if isinstance(a, dict):
-            lines.append(f"- **执行 Agent**：{a.get('name', '')}（{a.get('role', '')}）")
+            name = a.get('name', '')
+            role = a.get('role', '')
+            sid = a.get('server_id', '')
+            if sid:
+                lines.append(f"- **执行 Agent**：{name}（{role}）→ 服务器: `{sid}`")
+            else:
+                lines.append(f"- **执行 Agent**：{name}（{role}）")
     if stype == "simple_qa" and config.get("question"):
         lines.append(f"- **问题**：{config['question']}")
     elif stype == "code_execution":

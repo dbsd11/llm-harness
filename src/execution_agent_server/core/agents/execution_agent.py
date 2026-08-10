@@ -94,9 +94,10 @@ class ExecutionAgent(BaseAgent):
                 raise ValueError("No question or goal provided in context")
 
             upstream = context.get("upstream_outputs") or []
+            server_id = context.get("server_id", "")
             logger.info(f"ExecutionAgent (ReAct) processing: {question[:100]}...")
 
-            output = self._react_loop(task_id, question, upstream)
+            output = self._react_loop(task_id, question, upstream, server_id=server_id)
 
             event_bus.emit("task.execution_completed", {
                 "task_id": task_id,
@@ -125,7 +126,7 @@ class ExecutionAgent(BaseAgent):
             }
 
     def _react_loop(self, task_id: str, question: str,
-                    upstream: List[str]) -> str:
+                    upstream: List[str], server_id: str = "") -> str:
         """ReAct loop: reason -> act (tool) -> observe -> repeat."""
         system_msg = (
             f"{self.system_prompt}\n\n"
@@ -133,6 +134,8 @@ class ExecutionAgent(BaseAgent):
             "当任务需要运行命令（python 脚本、curl、文件操作等）时，请使用该工具。"
             "观察命令输出后继续推理，直到完成任务并给出最终回答。"
         )
+        if server_id:
+            system_msg += f"\n\n当前执行服务器 ID：`{server_id}`"
         if upstream:
             system_msg += "\n\n前序任务的输出：\n" + "\n---\n".join(upstream)
 

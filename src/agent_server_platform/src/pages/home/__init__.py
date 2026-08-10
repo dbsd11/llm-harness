@@ -250,14 +250,27 @@ def create_page(global_state_component):
             if pending.get("description"):
                 lines.append(f"- **描述**：{pending['description']}")
             roles = config.get("agent_roles") or {}
+            sched = (roles.get("scheduling_agent") or {}).get("role")
+            if sched:
+                lines.append(f"- **调度 Agent**：{sched}")
             exec_agents = roles.get("execution_agents") or []
             for a in exec_agents:
                 if isinstance(a, dict):
-                    lines.append(f"- **执行 Agent**：{a.get('name', '')}（{a.get('role', '')}）")
+                    name = a.get('name', '')
+                    role = a.get('role', '')
+                    sid = a.get('server_id', '')
+                    if sid:
+                        lines.append(f"- **执行 Agent**：{name}（{role}）→ 服务器: `{sid}`")
+                    else:
+                        lines.append(f"- **执行 Agent**：{name}（{role}）")
             if config.get("question"):
                 lines.append(f"- **问题**：{config['question']}")
             if config.get("script") or config.get("code"):
                 lines.append("- **代码**：已填写")
+            if config.get("timeout"):
+                lines.append(f"- **超时**：{config['timeout']} 秒")
+            if config.get("manual_acceptance"):
+                lines.append("- **人工验收**：已启用")
             return "\n".join(lines)
 
         def _draft_updates(pending, dirty):

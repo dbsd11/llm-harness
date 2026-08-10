@@ -65,9 +65,14 @@ class ExecutionAgent(BaseAgent):
 
             logger.info(f"ExecutionAgent processing question: {question[:100]}...")
 
+            system_content = self.system_prompt
+            server_id = context.get("server_id", "")
+            if server_id:
+                system_content += f"\n\n当前执行服务器 ID：`{server_id}`"
+
             # Build messages for LLM
             messages = [
-                {"role": "system", "content": self.system_prompt},
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": question}
             ]
 
