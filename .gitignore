@@ -4,7 +4,8 @@
 .env.production
 .env.*.local
 !.env.example
-deploy/
+scripts/deploy/credentials.env
+scripts/deploy/certs/
 
 # ── Databases (dev SQLite data) ──────────────────────────────────────────────
 *.db

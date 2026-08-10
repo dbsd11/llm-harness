@@ -172,13 +172,13 @@ python src/app.py
 
 ```bash
 # WS server (core backend)
-cd src/websocket_server && bash scripts/deploy/websocket_server.sh
+bash scripts/deploy/websocket_server.sh
 
 # Execution-agent servers
-cd src/execution_agent_server && bash scripts/deploy/execution_agent_server.sh
+bash scripts/deploy/execution_agent_server.sh
 
 # Agent server platform (presentation)
-cd src/agent_server_platform && bash scripts/deploy/agent_server_platform.sh
+bash scripts/deploy/agent_server_platform.sh
 ```
 
 ## Configuration
