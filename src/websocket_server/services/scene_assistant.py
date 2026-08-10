@@ -80,6 +80,41 @@ def gather_human_servers() -> str:
     return "\n".join(lines)
 
 
+def gather_execution_servers() -> str:
+    """返回已注册的执行 Agent 服务器清单（含在线状态），供 LLM 准确分配 server_id。
+
+    ponytail: query local DB directly — this runs inside ws_server, not the platform.
+    """
+    from database.repositories.execution_server_repository import ExecutionServerRepository
+
+    try:
+        servers = ExecutionServerRepository().list_all()
+    except Exception as e:
+        logger.warning(f"Failed to query execution servers from local DB: {e}")
+        return "（无法获取执行服务器列表）"
+
+    exec_servers = [s for s in servers if getattr(s, 'source', '') != 'human_agent']
+    if not exec_servers:
+        return "（当前没有已注册的执行 Agent 服务器，execution_agents 中不要填写 server_id）"
+    lines = []
+    for s in exec_servers:
+        status = getattr(s, 'status', 'unknown')
+        online_mark = "✅" if status == "online" else "⚠️离线"
+        lines.append(f"- server_id: `{s.server_id}` | 名称: {s.name or ''} | {online_mark}")
+    return "\n".join(lines)
+
+
+def get_known_server_ids() -> set:
+    """返回所有已注册的服务器 ID 集合（用于校验 scene-spec 中的 server_id）。"""
+    from database.repositories.execution_server_repository import ExecutionServerRepository
+
+    try:
+        servers = ExecutionServerRepository().list_all()
+        return {s.server_id for s in servers if getattr(s, 'server_id', '')}
+    except Exception:
+        return set()
+
+
 def summarize_scenario(scenario_id: str) -> str:
     """把场景元信息 + 对话历史压缩为可读文本，供 LLM 总结。
 
@@ -174,6 +209,22 @@ def validate_scene_spec(spec: Dict[str, Any]) -> Tuple[bool, str]:
     return True, ""
 
 
+def check_server_id_warnings(spec: Dict[str, Any]) -> str:
+    """检查 spec 中 execution_agents 的 server_id 是否匹配已知服务器，返回警告文本（空串表示无警告）。"""
+    roles = (spec.get("config") or {}).get("agent_roles") or {}
+    exec_agents = roles.get("execution_agents") or []
+    used_ids = {a.get("server_id") for a in exec_agents if isinstance(a, dict) and a.get("server_id")}
+    if not used_ids:
+        return ""
+    known = get_known_server_ids()
+    if not known:
+        return ""
+    bad = used_ids - known
+    if bad:
+        return f"⚠️ 以下 server_id 不存在于已注册服务器中：{', '.join(sorted(bad))}。请从【可用执行 Agent 服务器】列表中选择。"
+    return ""
+
+
 def _exec_agent_ok(a: Any) -> bool:
     return isinstance(a, dict) and bool(a.get("name")) and bool(a.get("role"))
 
@@ -214,8 +265,14 @@ def render_preview(spec: Optional[Dict[str, Any]]) -> str:
     if config.get("manual_acceptance"):
         lines.append("- **人工验收**：已启用")
     ok, err = validate_scene_spec(spec)
+    sid_warn = check_server_id_warnings(spec)
     lines.append("")
-    lines.append(f"> {'✅ 校验通过，可点「确认保存到数据库」' if ok else '⚠️ ' + err}")
+    if sid_warn:
+        lines.append(f"> {sid_warn}")
+    elif ok:
+        lines.append("> ✅ 校验通过，可点「确认保存到数据库」")
+    else:
+        lines.append(f"> ⚠️ {err}")
     return "\n".join(lines)
 
 
@@ -229,6 +286,9 @@ def save_scene(spec: Dict[str, Any], scenario_id: str = None) -> Tuple[Optional[
     ok, err = validate_scene_spec(spec)
     if not ok:
         return None, err
+    sid_warn = check_server_id_warnings(spec)
+    if sid_warn:
+        return None, sid_warn
     try:
         if scenario_id:
             # 仅允许修改初始化状态的场景
@@ -307,6 +367,7 @@ config 形状：
 **执行 Agent（execution_agents）— 必填，至少 1 个**：
 - 每个执行 Agent 代表一个角色，由调度 Agent 分配子任务。
 - `server_id` 可选：指定该角色绑定到哪个执行服务器。不填则使用本地后端执行。
+- **⚠️ server_id 必须严格使用【可用执行 Agent 服务器】列表中列出的 server_id，逐字复制，不得自行编造、猜测或简化。** 若列表为空则不填 server_id。
 - `server_id` 可以指向 **人工 Agent 服务器**（source='human_agent'），这样该角色的任务会路由给真人操作者处理。
 - 示例：`{"name": "计算专家", "role": "擅长数学计算与逻辑推理"}`、`{"name": "代码执行专家", "role": "负责执行代码并返回结果"}`
 - 若用户要求某角色由人工处理，将该角色的 `server_id` 设为对应的人工 Agent 服务器即可，**不需要单独的 human_agents 配置**。
@@ -342,6 +403,7 @@ def _build_messages(user_text: str, history: List[Dict[str, Any]],
     """组装 LLM messages：system（含场景清单/聚焦/当前草稿）+ 历史 + 当前输入。"""
     sys = _SYSTEM_PROMPT
     sys += "\n\n【场景清单】\n" + gather_scene_index()
+    sys += "\n\n【可用执行 Agent 服务器】\n" + gather_execution_servers()
     sys += "\n\n【可用人工 Agent 服务器】\n" + gather_human_servers()
 
     # 若用户输入疑似指向某场景 id，注入聚焦上下文
