@@ -98,8 +98,9 @@ def gather_execution_servers() -> str:
         return "（当前没有已注册的执行 Agent 服务器，execution_agents 中不要填写 server_id）"
     lines = []
     for s in exec_servers:
+        connected = getattr(s, 'connected', False)
         status = getattr(s, 'status', 'unknown')
-        online_mark = "✅" if status == "online" else "⚠️离线"
+        online_mark = "✅" if connected or status in ("idle", "running") else "⚠️离线"
         lines.append(f"- server_id: `{s.server_id}` | 名称: {s.name or ''} | {online_mark}")
     return "\n".join(lines)
 
