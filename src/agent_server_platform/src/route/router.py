@@ -42,6 +42,7 @@ def make_gr_route():
     # Route configuration (Home is already the default page inside gr.Blocks)
     routes = [
         {"title": "Scenario Dashboard", "path": "/scenario_dashboard", "module": "scenario_dashboard", "show_in_navbar": True},
+        {"title": "Workflow DAG", "path": "/workflow_dashboard", "module": "workflow_dashboard", "show_in_navbar": True},
         {"title": "Task Monitor", "path": "/task_monitor", "module": "task_monitor", "show_in_navbar": True},
         {"title": "Agent Registry", "path": "/agent_registry", "module": "agent_registry", "show_in_navbar": True},
         {"title": "Execution Servers", "path": "/execution_servers", "module": "execution_servers", "show_in_navbar": True},

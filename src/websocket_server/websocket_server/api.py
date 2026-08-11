@@ -207,6 +207,7 @@ def register_routes(app: web.Application, ws_server) -> None:
     from .api_routes_event import register_event_routes
     from .api_routes_agent import register_agent_routes
     from .api_routes_tool import register_tool_routes
+    from .api_routes_workflow import register_workflow_routes
 
     register_scenario_routes(app)
     register_task_routes(app)
@@ -214,4 +215,5 @@ def register_routes(app: web.Application, ws_server) -> None:
     register_event_routes(app)
     register_agent_routes(app)
     register_tool_routes(app)
+    register_workflow_routes(app)
     logger.info("All API routes registered")

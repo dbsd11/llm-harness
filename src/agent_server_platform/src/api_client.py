@@ -18,6 +18,17 @@ class APIClient:
     def __init__(self):
         self.base_url = os.getenv("WS_SERVER_API_URL", "https://agent-socket-server.bdzz.com.cn:8765")
 
+    @staticmethod
+    def _extract_error(e: Exception) -> str:
+        if isinstance(e, requests.HTTPError) and e.response is not None:
+            try:
+                body = e.response.json()
+                if isinstance(body, dict) and "error" in body:
+                    return body["error"]
+            except (ValueError, KeyError):
+                pass
+        return str(e)
+
     def _get(self, path: str, params: Dict[str, Any] = None) -> dict:
         try:
             resp = requests.get(f"{self.base_url}{path}", params=params, timeout=10, verify=False)
@@ -25,7 +36,7 @@ class APIClient:
             return resp.json()
         except Exception as e:
             logger.error(f"API GET {path} failed: {e}")
-            return {"success": False, "error": str(e)}
+            return {"success": False, "error": self._extract_error(e)}
 
     def _post(self, path: str, data: Dict[str, Any] = None,
               timeout: int = 180) -> dict:
@@ -36,7 +47,7 @@ class APIClient:
             return resp.json()
         except Exception as e:
             logger.error(f"API POST {path} failed: {e}")
-            return {"success": False, "error": str(e)}
+            return {"success": False, "error": self._extract_error(e)}
 
     def _delete(self, path: str) -> dict:
         try:
@@ -45,7 +56,17 @@ class APIClient:
             return resp.json()
         except Exception as e:
             logger.error(f"API DELETE {path} failed: {e}")
-            return {"success": False, "error": str(e)}
+            return {"success": False, "error": self._extract_error(e)}
+
+    def _put(self, path: str, data: Dict[str, Any] = None) -> dict:
+        try:
+            resp = requests.put(f"{self.base_url}{path}", json=data or {},
+                                timeout=10, verify=False)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"API PUT {path} failed: {e}")
+            return {"success": False, "error": self._extract_error(e)}
 
     # ── scenarios ─────────────────────────────────────────────────────────
 
@@ -176,6 +197,54 @@ class APIClient:
 
     def list_servers(self) -> dict:
         return self._get("/api/servers")
+
+    # ── workflows ─────────────────────────────────────────────────────────
+
+    def publish_workflow(self, scenario_id: str, name: str = None,
+                         description: str = None, created_by: str = None) -> dict:
+        return self._post("/api/workflows/publish", {
+            "scenario_id": scenario_id, "name": name,
+            "description": description, "created_by": created_by,
+        })
+
+    def list_workflows(self, state: str = None, limit: int = 100) -> dict:
+        params = {"limit": limit}
+        if state:
+            params["state"] = state
+        return self._get("/api/workflows", params)
+
+    def get_workflow(self, workflow_id: str) -> dict:
+        return self._get(f"/api/workflows/{workflow_id}")
+
+    def update_workflow(self, workflow_id: str, data: dict) -> dict:
+        return self._put(f"/api/workflows/{workflow_id}", data)
+
+    def delete_workflow(self, workflow_id: str) -> dict:
+        return self._delete(f"/api/workflows/{workflow_id}")
+
+    def execute_workflow(self, workflow_id: str, input_params: dict,
+                         created_by: str = None) -> dict:
+        return self._post(f"/api/workflows/{workflow_id}/execute", {
+            "input_params": input_params, "created_by": created_by,
+        }, timeout=30)
+
+    def list_workflow_executions(self, workflow_id: str, limit: int = 50) -> dict:
+        return self._get(f"/api/workflows/{workflow_id}/executions", {"limit": limit})
+
+    def get_workflow_execution(self, execution_id: str) -> dict:
+        return self._get(f"/api/workflows/executions/{execution_id}")
+
+    def cancel_workflow_execution(self, execution_id: str) -> dict:
+        return self._post(f"/api/workflows/executions/{execution_id}/cancel")
+
+    def list_all_workflow_executions(self, limit: int = 50, state: str = None) -> dict:
+        params = {"limit": limit}
+        if state:
+            params["state"] = state
+        return self._get("/api/workflows/executions", params)
+
+    def get_workflow_execution_detail(self, execution_id: str) -> dict:
+        return self._get(f"/api/workflows/executions/{execution_id}", {"include_tasks": "true"})
 
 
 # Global singleton

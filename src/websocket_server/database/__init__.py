@@ -14,6 +14,9 @@ from .models.consumer_offset import ConsumerOffset
 from .models.execution_server import ExecutionServer
 from .models.assistant_message import AssistantMessage
 from .models.human_task import HumanTask
+from .models.workflow import Workflow
+from .models.workflow_execution import WorkflowExecution
+from .models.workflow_task_template import WorkflowTaskTemplate
 
 from .repositories.base_repository import BaseRepository
 
@@ -35,6 +38,9 @@ def init_database():
             ExecutionServer,
             AssistantMessage,
             HumanTask,
+            Workflow,
+            WorkflowExecution,
+            WorkflowTaskTemplate,
         ]
 
         for model_class in models:
@@ -61,6 +67,10 @@ def init_database():
         AssistantMessageRepository()._ensure_columns()
         logger.info("AssistantMessage table migration complete")
 
+        from .repositories.workflow_execution_repository import WorkflowExecutionRepository
+        WorkflowExecutionRepository()._ensure_columns()
+        logger.info("WorkflowExecution table migration complete")
+
         # 创建关键查询索引，避免 dispatch 轮询 / 心跳清扫 / task 查询走全表扫描
         # （全表扫描是 event loop 被同步 DB I/O 阻塞的主要放大因素之一）。
         _indexes = [
@@ -70,6 +80,9 @@ def init_database():
             "CREATE INDEX IF NOT EXISTS idx_exec_servers_conn_hb ON execution_servers(connected, last_heartbeat)",
             "CREATE INDEX IF NOT EXISTS idx_tasks_scenario_id ON tasks(scenario_id)",
             "CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)",
+            "CREATE INDEX IF NOT EXISTS idx_workflows_scenario_id ON workflows(source_scenario_id)",
+            "CREATE INDEX IF NOT EXISTS idx_wf_executions_workflow_id ON workflow_executions(workflow_id)",
+            "CREATE INDEX IF NOT EXISTS idx_wf_executions_scenario_id ON workflow_executions(scenario_id)",
         ]
         try:
             cm = get_connection_manager()
