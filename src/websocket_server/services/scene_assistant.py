@@ -426,6 +426,27 @@ def summarize_workflow(workflow_id: str) -> str:
     else:
         lines.append("（暂无步骤）")
 
+    if wf.source_scenario_id:
+        scenario = ScenarioRepository().find_by_scenario_id(wf.source_scenario_id)
+        if scenario:
+            try:
+                config = json.loads(scenario.config or "{}")
+            except (json.JSONDecodeError, TypeError):
+                config = {}
+            exec_agents = ((config.get("agent_roles") or {}).get("execution_agents") or [])
+            if exec_agents:
+                lines.append(f"\n来源场景 {wf.source_scenario_id[:8]}（{scenario.name}）的执行 Agent 分配：")
+                lines.append("（修改 Workflow 时应沿用以下 server_id，保持一致）")
+                for a in exec_agents:
+                    if isinstance(a, dict):
+                        name = a.get("name", "")
+                        role = a.get("role", "")
+                        sid = a.get("server_id", "")
+                        if sid:
+                            lines.append(f"  - {name}（{role}）→ server_id: `{sid}`")
+                        else:
+                            lines.append(f"  - {name}（{role}）→ 未指定服务器（本地执行）")
+
     return "\n".join(lines)
 
 
@@ -606,6 +627,7 @@ def save_workflow(spec: Dict[str, Any], workflow_id: str = None) -> Tuple[Option
         steps = spec.get("steps") or []
         agent_roles = spec.get("agent_roles") or {}
         input_schema = spec.get("input_schema") or {}
+        source_scenario_id = spec.get("source_scenario_id") or ""
 
         dag_definition = json.dumps({"steps": steps}, ensure_ascii=False)
 
@@ -620,6 +642,8 @@ def save_workflow(spec: Dict[str, Any], workflow_id: str = None) -> Tuple[Option
             existing.dag_definition = dag_definition
             existing.input_schema = json.dumps(input_schema, ensure_ascii=False)
             existing.agent_roles = json.dumps(agent_roles, ensure_ascii=False)
+            if source_scenario_id:
+                existing.source_scenario_id = source_scenario_id
             existing.version = new_version
             existing.updated_at = now
             wf_repo.update(existing)
@@ -633,7 +657,7 @@ def save_workflow(spec: Dict[str, Any], workflow_id: str = None) -> Tuple[Option
                 workflow_id=new_wf_id,
                 name=spec.get("name", ""),
                 description=spec.get("description", ""),
-                source_scenario_id="",
+                source_scenario_id=source_scenario_id,
                 dag_definition=dag_definition,
                 input_schema=json.dumps(input_schema, ensure_ascii=False),
                 agent_roles=json.dumps(agent_roles, ensure_ascii=False),
@@ -715,6 +739,7 @@ def load_workflow_spec(workflow_id: str) -> Optional[Dict[str, Any]]:
     return {
         "name": wf.name or "",
         "description": wf.description or "",
+        "source_scenario_id": wf.source_scenario_id or "",
         "input_schema": input_schema,
         "agent_roles": agent_roles,
         "steps": steps,
@@ -836,6 +861,7 @@ workflow-spec 格式：
 {
   "name": "Workflow名称",
   "description": "可选描述",
+  "source_scenario_id": "来源场景 ID（若基于已有场景创建，填写场景 ID；否则省略）",
   "input_schema": {
     "type": "object",
     "properties": {
@@ -876,6 +902,7 @@ workflow-spec 格式：
 **基于场景创建 Workflow 时的 server_id 规则**：
 - 若用户要求基于某个已有场景创建 Workflow，你**必须**参考【场景聚焦】中的「场景执行 Agent 分配」，将每个执行 Agent 的 `server_id` 原样映射到 Workflow 对应步骤的 `server_id`。
 - 角色对应关系：根据 Agent 名称和角色描述，将场景的 execution_agents 匹配到 Workflow 的 agent_roles 和 steps。
+- 同时，在 workflow-spec 中填写 `source_scenario_id` 为该场景的 ID，以便后续修改 Workflow 时能自动关联来源场景的执行 Agent 配置。
 - 这样可确保 Workflow 的执行服务器与原场景一致，避免执行漂移。
 
 **重要**：当你正在**创建新 Workflow**或**修改已有 Workflow**时，在回复末尾附一个完整的 ```workflow-spec``` 代码块。格式：
