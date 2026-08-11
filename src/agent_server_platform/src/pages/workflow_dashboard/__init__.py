@@ -1,4 +1,4 @@
-# Workflow Dashboard page — view, publish, execute, and monitor DAG workflows
+# Workflow Dashboard page — view, publish, and execute DAG workflows
 import json
 import gradio as gr
 
@@ -21,30 +21,6 @@ def _build_mermaid_dag(dag_def):
     return "\n".join(lines)
 
 
-def _build_run_mermaid_dag(dag_def, task_states):
-    steps = dag_def.get("steps", []) if isinstance(dag_def, dict) else []
-    if not steps:
-        return "graph TD\n    A[No steps]"
-    state_colors = {
-        "success": "#d4edda",
-        "failed": "#f8d7da",
-        "running": "#fff3cd",
-        "pending": "#e2e3e5",
-    }
-    lines = ["graph TD"]
-    for step in steps:
-        sid = step.get("step_id", "")
-        label = (step.get("goal_template", "") or "")[:40]
-        st = task_states.get(sid, "pending")
-        color = state_colors.get(st, "#e2e3e5")
-        lines.append(f'    {sid}["{sid}: {label}"]\n    style {sid} fill:{color}')
-    for step in steps:
-        sid = step.get("step_id", "")
-        for dep in step.get("depends_on", []):
-            lines.append(f"    {dep} --> {sid}")
-    return "\n".join(lines)
-
-
 def create_page(global_state_component):
     with gr.Blocks(css="""
         .wf-action-btn {
@@ -57,12 +33,8 @@ def create_page(global_state_component):
         show_detail_trigger = gr.Textbox(value="", visible=False)
         show_execute_trigger = gr.Textbox(value="", visible=False)
         show_publish_trigger = gr.Textbox(value="", visible=False)
-        show_monitor_trigger = gr.Textbox(value="", visible=False)
-        show_runs_trigger = gr.Textbox(value="", visible=False)
-        show_run_detail_trigger = gr.Textbox(value="", visible=False)
 
         current_workflow_id = gr.State(value="")
-        current_execution_id = gr.State(value="")
 
         with gr.Column(visible=True) as zone_list:
             gr.Markdown("## Workflow DAG Management")
@@ -72,7 +44,6 @@ def create_page(global_state_component):
                     value="all", label="State Filter", scale=1)
                 wf_search = gr.Textbox(label="Search", placeholder="Workflow name...", scale=2)
                 publish_btn = gr.Button("Publish from Scenario", variant="primary", scale=1)
-                runs_btn = gr.Button("Recent Runs", variant="secondary", scale=1)
 
             @gr.render(inputs=[wf_state_filter, wf_search, show_publish_trigger])
             def render_workflow_list(state_filter, search, _publish_trigger):
@@ -227,24 +198,77 @@ def create_page(global_state_component):
         with gr.Column(visible=False) as zone_execute:
             gr.Markdown("## Execute Workflow")
             exec_info = gr.Markdown("")
-            exec_params = gr.JSON(label="Input Parameters", value={})
+            exec_param_info = gr.Markdown("")
+            exec_schema = gr.State({})
+            exec_params = gr.Textbox(
+                label="Input Parameters (JSON)",
+                lines=10, placeholder='{\n  "key": "value"\n}')
             exec_server_status = gr.Markdown("")
             with gr.Row():
                 exec_submit = gr.Button("Execute", variant="primary")
                 exec_back = gr.Button("Back")
             exec_result = gr.Markdown("")
 
+            def _build_param_info(schema):
+                props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+                required = set(schema.get("required", [])) if isinstance(schema, dict) else set()
+                if not props:
+                    return "*No input parameters required.*"
+                lines = ["| Parameter | Type | Required | Description |",
+                         "|-----------|------|----------|-------------|"]
+                for key, prop in props.items():
+                    ptype = prop.get("type", "string")
+                    desc = prop.get("description", "")
+                    example = prop.get("example", "")
+                    req = "Yes" if key in required else "No"
+                    example_str = f" e.g. `{example}`" if example != "" else ""
+                    lines.append(f"| `{key}` | {ptype} | {req} | {desc}{example_str} |")
+                return "\n".join(lines)
+
+            def _build_defaults(schema):
+                props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+                defaults = {}
+                for key, prop in props.items():
+                    defaults[key] = prop.get("example", "")
+                return defaults
+
+            def _coerce_params(params, schema):
+                if not isinstance(params, dict):
+                    try:
+                        params = json.loads(params) if isinstance(params, str) else {}
+                    except (json.JSONDecodeError, TypeError):
+                        return None, "Invalid parameters format."
+                props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+                for key, prop in props.items():
+                    if key not in params:
+                        continue
+                    val = params[key]
+                    expected = prop.get("type", "string")
+                    if isinstance(val, str):
+                        if expected == "integer":
+                            try:
+                                params[key] = int(val)
+                            except ValueError:
+                                return None, f"Parameter '{key}' must be an integer, got '{val}'"
+                        elif expected == "number":
+                            try:
+                                params[key] = float(val)
+                            except ValueError:
+                                return None, f"Parameter '{key}' must be a number, got '{val}'"
+                        elif expected == "boolean":
+                            params[key] = val.lower() in ("true", "1", "yes")
+                return params, ""
+
             def _show_execute_page(wf_id):
                 resp = api_client.get_workflow(wf_id)
                 if not resp.get("success"):
                     return (gr.update(visible=True), gr.update(visible=False),
-                            f"Error: {resp.get('error')}", {}, "", "", "")
+                            f"Error: {resp.get('error')}", "", {}, "{}", "", "", "")
 
                 wf = resp.get("workflow", {})
                 schema = wf.get("input_schema", {})
-                default_params = {}
-                for key, prop in schema.get("properties", {}).items():
-                    default_params[key] = prop.get("example", "")
+                info_md = _build_param_info(schema)
+                defaults = _build_defaults(schema)
 
                 servers_resp = api_client.list_servers()
                 servers = servers_resp.get("servers", []) if isinstance(servers_resp, dict) else []
@@ -268,216 +292,40 @@ def create_page(global_state_component):
 
                 info = f"**{wf.get('name', '')}** (v{wf.get('version', 1)})"
                 return (gr.update(visible=False), gr.update(visible=True),
-                        info, default_params, server_status, wf_id, "")
+                        info, info_md, schema, json.dumps(defaults, indent=2, ensure_ascii=False),
+                        server_status, wf_id, "")
 
             show_execute_trigger.change(
                 _show_execute_page,
                 inputs=[show_execute_trigger],
-                outputs=[zone_list, zone_execute, exec_info, exec_params,
-                         exec_server_status, current_workflow_id, exec_result])
+                outputs=[zone_list, zone_execute, exec_info, exec_param_info,
+                         exec_schema, exec_params, exec_server_status,
+                         current_workflow_id, exec_result])
 
-            def _do_execute(wf_id, params):
+            def _do_execute(wf_id, params, schema):
                 if not wf_id:
                     return "No workflow selected."
-                if not isinstance(params, dict):
-                    try:
-                        params = json.loads(params) if isinstance(params, str) else {}
-                    except (json.JSONDecodeError, TypeError):
-                        return "Invalid parameters format."
+                params, err = _coerce_params(params, schema)
+                if err:
+                    return err
+                required = (schema.get("required", [])
+                            if isinstance(schema, dict) else [])
+                for field in required:
+                    if field not in params or params[field] == "":
+                        return f"Missing required parameter: **{field}**"
                 resp = api_client.execute_workflow(wf_id, params)
                 if resp.get("success"):
                     exe = resp.get("execution", {})
-                    return (f"**Execution started!** ID: `{exe.get('execution_id', '')}` | "
-                            f"Steps: {exe.get('total_steps', 0)}")
+                    return (f"**Execution started!** Scenario ID: `{exe.get('scenario_id', '')}` | "
+                            f"Steps: {exe.get('total_steps', 0)}\n\n"
+                            f"Track progress in the Scenarios dashboard.")
                 return f"**Error:** {resp.get('error', 'Unknown')}"
 
             exec_submit.click(_do_execute,
-                              inputs=[current_workflow_id, exec_params],
+                              inputs=[current_workflow_id, exec_params, exec_schema],
                               outputs=exec_result)
             exec_back.click(lambda: (gr.update(visible=True), gr.update(visible=False)),
                             outputs=[zone_list, zone_execute])
-
-        with gr.Column(visible=False) as zone_runs:
-            gr.Markdown("## Recent Workflow Runs")
-            with gr.Row():
-                run_state_filter = gr.Dropdown(
-                    choices=["all", "running", "completed", "failed", "cancelled"],
-                    value="all", label="State Filter", scale=1)
-                runs_back = gr.Button("Back to List", scale=1)
-
-            @gr.render(inputs=[run_state_filter, show_runs_trigger])
-            def render_run_list(state_filter, _trigger):
-                resp = api_client.list_all_workflow_executions(
-                    limit=50,
-                    state=state_filter if state_filter != "all" else None)
-                executions = resp.get("executions", []) if isinstance(resp, dict) else []
-
-                wf_map = {}
-                wf_resp = api_client.list_workflows()
-                for w in (wf_resp.get("workflows", []) if isinstance(wf_resp, dict) else []):
-                    wf_map[w.get("workflow_id", "")] = w.get("name", "Unknown")
-
-                if not executions:
-                    gr.Markdown("*No executions found.*")
-                    return
-
-                for exe in executions:
-                    with gr.Row():
-                        eid = exe.get("execution_id", "")
-                        wf_name = wf_map.get(exe.get("workflow_id", ""), "Unknown")
-                        state = exe.get("state", "?")
-                        completed = exe.get("completed_steps", 0)
-                        total = exe.get("total_steps", 0)
-                        started = (exe.get("started_at") or "")[:19]
-                        gr.Markdown(
-                            f"`{eid[:12]}...` | **{wf_name}** | "
-                            f"State: `{state}` | Steps: {completed}/{total} | "
-                            f"Started: {started}")
-                        run_detail_btn = gr.Button(
-                            "Detail", size="sm", elem_classes="wf-action-btn")
-
-                        def _show_run_detail(eid=eid):
-                            return eid
-
-                        run_detail_btn.click(
-                            _show_run_detail, outputs=show_run_detail_trigger)
-
-            runs_btn.click(
-                lambda: (gr.update(visible=False), gr.update(visible=True)),
-                outputs=[zone_list, zone_runs])
-            runs_back.click(
-                lambda: (gr.update(visible=True), gr.update(visible=False)),
-                outputs=[zone_list, zone_runs])
-
-        with gr.Column(visible=False) as zone_run_detail:
-            gr.Markdown("## Execution Run Detail")
-            run_exec_info = gr.JSON(label="Execution Info")
-            run_task_table = gr.Dataframe(
-                headers=["Task ID", "Goal", "State", "Agent", "Duration(s)", "Error"],
-                label="Task Steps", wrap=True)
-            run_dag_html = gr.HTML("")
-            run_msg_table = gr.Dataframe(
-                headers=["Time", "Type", "Sender", "Receiver", "Content"],
-                label="Message History", wrap=True)
-            with gr.Row():
-                run_detail_back = gr.Button("Back to Runs")
-                run_cancel_btn = gr.Button("Cancel Execution", variant="stop")
-            run_detail_timer = gr.Timer(value=5, render=False)
-
-            def _navigate_to_run_detail(exec_id):
-                if not exec_id:
-                    return gr.update(), gr.update(), ""
-                return (gr.update(visible=False), gr.update(visible=True),
-                        exec_id)
-
-            def _refresh_run_detail(exec_id):
-                if not exec_id:
-                    return {}, [], "", []
-
-                resp = api_client.get_workflow_execution_detail(exec_id)
-                if not resp.get("success"):
-                    return {"error": resp.get("error", "Not found")}, [], "", []
-
-                exe = resp.get("execution", {})
-                tasks = exe.get("tasks", [])
-
-                task_rows = []
-                task_states = {}
-                for t in tasks:
-                    state = t.get("state", "")
-                    goal = (t.get("goal", "") or "")[:80]
-                    task_states[goal.split(":")[0]] = state
-                    task_rows.append([
-                        t.get("task_id", "")[:16] + "...",
-                        goal,
-                        state,
-                        t.get("agent_name", "") or t.get("agent_role", "") or "",
-                        t.get("execution_duration", "") or "",
-                        (t.get("error", "") or "")[:80],
-                    ])
-
-                wf_resp = api_client.get_workflow(exe.get("workflow_id", ""))
-                dag_def = {}
-                if wf_resp.get("success"):
-                    dag_def = wf_resp.get("workflow", {}).get("dag_definition", {})
-
-                for t in tasks:
-                    goal = (t.get("goal", "") or "")[:80]
-                    sid = goal.split(":")[0]
-                    task_states[sid] = t.get("state", "pending")
-
-                dag_text = _build_run_mermaid_dag(dag_def, task_states)
-                dag_html = (
-                    f'<div style="border:1px solid #ddd;padding:12px;'
-                    f'border-radius:6px;">'
-                    f'<pre style="font-size:12px;overflow-x:auto;">'
-                    f'{dag_text}</pre></div>'
-                )
-
-                msg_rows = []
-                scenario_id = exe.get("scenario_id", "")
-                if scenario_id:
-                    msg_resp = api_client.get_scenario_messages(scenario_id)
-                    entries = (msg_resp.get("messages", [])
-                               if msg_resp.get("success") else [])
-                    msg_rows = [
-                        [e.get("time", ""), e.get("type", ""),
-                         e.get("sender", ""), e.get("receiver", ""),
-                         e.get("content", "")]
-                        for e in entries
-                    ]
-                    msg_rows.sort(key=lambda r: r[0], reverse=True)
-                else:
-                    task_results = exe.get("task_results", {})
-                    if isinstance(task_results, dict):
-                        for step_id, step_data in task_results.items():
-                            result = step_data.get("result", {})
-                            state = step_data.get("state", "")
-                            question = (result.get("question", "") or "")[:120]
-                            output = (result.get("output", "") or "")[:200]
-                            created = exe.get("created_at", "")
-                            completed = exe.get("completed_at", "")
-                            msg_rows.append([
-                                created, "dispatch", "scheduling",
-                                "execution",
-                                f"[{step_id}] {question}",
-                            ])
-                            msg_rows.append([
-                                completed, "reply", "execution",
-                                "scheduling",
-                                f"[{step_id}] {state}: {output}",
-                            ])
-
-                return exe, task_rows, dag_html, msg_rows
-
-            show_run_detail_trigger.change(
-                _navigate_to_run_detail,
-                inputs=[show_run_detail_trigger],
-                outputs=[zone_runs, zone_run_detail, current_execution_id]).then(
-                _refresh_run_detail,
-                inputs=[current_execution_id],
-                outputs=[run_exec_info, run_task_table, run_dag_html,
-                         run_msg_table])
-
-            run_detail_timer.tick(
-                _refresh_run_detail,
-                inputs=[current_execution_id],
-                outputs=[run_exec_info, run_task_table, run_dag_html,
-                         run_msg_table])
-
-            run_detail_back.click(
-                lambda: (gr.update(visible=True), gr.update(visible=False), ""),
-                outputs=[zone_runs, zone_run_detail, current_execution_id])
-
-            def _cancel_run(exec_id):
-                if exec_id:
-                    api_client.cancel_workflow_execution(exec_id)
-                return (gr.update(visible=True), gr.update(visible=False), "")
-
-            run_cancel_btn.click(
-                _cancel_run,
-                inputs=[current_execution_id],
-                outputs=[zone_runs, zone_run_detail, current_execution_id])
 
         gr.Timer(value=5, render=False)
 

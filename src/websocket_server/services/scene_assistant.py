@@ -807,7 +807,7 @@ config 形状：
 {
   "agent_roles": {
     "scheduling_agent": {"role": "调度角色描述"},
-    "execution_agents": [{"name": "Agent名", "role": "角色/专长", "server_id": "可选"}]
+    "execution_agents": [{"name": "Agent名", "role": "角色/专长", "server_id": "执行服务器ID"}]
   },
   "manual_acceptance": false,
   "question" | "script"/"code": ...,
@@ -817,10 +817,11 @@ config 形状：
 
 **执行 Agent（execution_agents）— 必填，至少 1 个**：
 - 每个执行 Agent 代表一个角色，由调度 Agent 分配子任务。
-- `server_id` 可选：指定该角色绑定到哪个执行服务器。不填则使用本地后端执行。
-- **⚠️ server_id 必须严格使用【可用执行 Agent 服务器】列表中列出的 server_id，逐字复制，不得自行编造、猜测或简化。** 若列表为空则不填 server_id。
+- **⚠️ 必须为每个执行 Agent 分配 `server_id`**：若【可用执行 Agent 服务器】列表非空，你**必须**为每个执行 Agent 指定一个 `server_id`，确保任务在真实服务器上执行。仅当列表为空时才省略 `server_id`。
+- `server_id` 必须严格使用【可用执行 Agent 服务器】列表中列出的 server_id，逐字复制，不得自行编造、猜测或简化。
+- 分配原则：根据 Agent 的角色和专长，选择最合适的服务器。若只有一个可用服务器，所有 Agent 都使用它；若有多个，根据角色合理分配。
 - `server_id` 可以指向 **人工 Agent 服务器**（source='human_agent'），这样该角色的任务会路由给真人操作者处理。
-- 示例：`{"name": "计算专家", "role": "擅长数学计算与逻辑推理"}`、`{"name": "代码执行专家", "role": "负责执行代码并返回结果"}`
+- 示例：`{"name": "计算专家", "role": "擅长数学计算与逻辑推理", "server_id": "exec-server-1"}`
 - 若用户要求某角色由人工处理，将该角色的 `server_id` 设为对应的人工 Agent 服务器即可，**不需要单独的 human_agents 配置**。
 
 **关于人工验收（manual_acceptance）**：

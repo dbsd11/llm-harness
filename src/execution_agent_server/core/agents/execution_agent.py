@@ -130,13 +130,17 @@ class ExecutionAgent(BaseAgent):
         """ReAct loop: reason -> act (tool) -> observe -> repeat."""
         system_msg = (
             f"{self.system_prompt}\n\n"
-            "你可以通过 run_bash 工具在服务器 shell 中执行命令。"
-            "当任务需要运行命令（python 脚本、curl、文件操作等）时，请使用该工具。"
-            "观察命令输出后继续推理，直到完成任务并给出最终回答。\n\n"
+            "你可以通过 run_bash 工具在服务器 shell 中执行命令。\n\n"
+            "【工作原则】\n"
+            "1. 明确目标：理解任务要求，制定简洁的执行计划\n"
+            "2. 高效执行：只运行必要的命令，避免重复探索\n"
+            "3. 及时总结：获取到足够信息后，立即生成最终答案，不要继续收集数据\n"
+            "4. 完整回答：最终答案应完整回应任务要求，包含所有必要信息\n\n"
             "【重要】文件输出约束：\n"
-            "- /data 是持久化数据目录，任务中生成的所有文件（文本、图片、音频、视频、PDF 等多模态文件）必须保存到 /data 目录下。\n"
-            "- 不要将生成的文件保存到 /tmp、/app 或其他临时目录，这些目录在容器重启后会丢失。\n"
-            "- 在最终回答中，请列出所有生成文件的完整路径（如 /data/report.pdf、/data/chart.png），以便后续任务或用户可以找到它们。"
+            "- /data 是持久化数据目录，任务中生成的所有文件必须保存到 /data 目录下\n"
+            "- 不要将生成的文件保存到 /tmp、/app 或其他临时目录\n"
+            "- 在最终回答中列出所有生成文件的完整路径\n\n"
+            "【注意】你最多有 10 次工具调用机会，请高效利用。当收集到足够信息时，直接给出完整答案，不要再调用工具。"
         )
         if server_id:
             system_msg += f"\n\n当前执行服务器 ID：`{server_id}`"
@@ -197,13 +201,60 @@ class ExecutionAgent(BaseAgent):
                     "content": tool_output,
                 })
         else:
-            final_text = content or "[max iterations reached]"
             logger.warning(
                 f"ReAct loop hit max iterations ({_MAX_REACT_ITERATIONS}) "
-                f"for task {task_id}"
+                f"for task {task_id}, synthesizing final answer from context"
             )
+            final_text = self._synthesize_final_answer(messages, task_id)
 
         return final_text
+
+    def _synthesize_final_answer(self, messages: List[Dict[str, Any]],
+                                 task_id: str) -> str:
+        """Make a final LLM call without tools to synthesize an answer from
+        all the context gathered during the ReAct loop."""
+        synthesis_prompt = (
+            "你已经达到了工具调用次数上限。请基于以上对话中收集到的所有信息，"
+            "直接生成完整的最终答案来回答用户的任务。不要再调用任何工具。\n\n"
+            "要求：\n"
+            "1. 综合所有已获取的信息，给出完整、有条理的回答\n"
+            "2. 如果某些信息缺失，基于已有内容尽力回答，标注不确定的部分\n"
+            "3. 如果生成了文件，列出文件路径\n"
+            "4. 直接输出最终答案，不要解释为什么停止"
+        )
+        synthesis_messages = messages + [
+            {"role": "user", "content": synthesis_prompt},
+        ]
+
+        try:
+            response = llm_client.chat_with_tools(synthesis_messages, [], temperature=0.3)
+            content = response.get("content", "") if response else ""
+            if content:
+                logger.info(
+                    f"Synthesized final answer ({len(content)} chars) "
+                    f"for task {task_id}"
+                )
+                return content
+        except Exception as e:
+            logger.error(f"Failed to synthesize final answer for {task_id}: {e}")
+
+        return self._build_fallback_summary(messages)
+
+    def _build_fallback_summary(self, messages: List[Dict[str, Any]]) -> str:
+        """Build a fallback summary from tool outputs when LLM synthesis fails."""
+        tool_outputs = []
+        for msg in messages:
+            if msg.get("role") == "tool" and msg.get("content"):
+                tool_outputs.append(msg["content"])
+
+        if not tool_outputs:
+            return "[任务未能完成：达到工具调用次数上限，且未能从执行上下文中提取结果]"
+
+        parts = ["[注意：达到工具调用次数上限，以下为已收集到的部分结果]\n\n"]
+        for i, output in enumerate(tool_outputs, 1):
+            truncated = output[:500] + "..." if len(output) > 500 else output
+            parts.append(f"--- 步骤 {i} 结果 ---\n{truncated}\n")
+        return "\n".join(parts)
 
     def cleanup(self) -> None:
         logger.info("ExecutionAgent cleaned up")

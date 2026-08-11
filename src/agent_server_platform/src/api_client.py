@@ -246,24 +246,6 @@ class APIClient:
             "input_params": input_params, "created_by": created_by,
         }, timeout=30)
 
-    def list_workflow_executions(self, workflow_id: str, limit: int = 50) -> dict:
-        return self._get(f"/api/workflows/{workflow_id}/executions", {"limit": limit})
-
-    def get_workflow_execution(self, execution_id: str) -> dict:
-        return self._get(f"/api/workflows/executions/{execution_id}")
-
-    def cancel_workflow_execution(self, execution_id: str) -> dict:
-        return self._post(f"/api/workflows/executions/{execution_id}/cancel")
-
-    def list_all_workflow_executions(self, limit: int = 50, state: str = None) -> dict:
-        params = {"limit": limit}
-        if state:
-            params["state"] = state
-        return self._get("/api/workflows/executions", params)
-
-    def get_workflow_execution_detail(self, execution_id: str) -> dict:
-        return self._get(f"/api/workflows/executions/{execution_id}", {"include_tasks": "true"})
-
 
 # Global singleton
 api_client = APIClient()

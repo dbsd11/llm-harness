@@ -33,10 +33,12 @@ _DRAWER_CSS = """
   inset: 0 !important;
   z-index: 9998;
   background: rgba(15, 23, 42, 0.45);
-  display: flex !important;
   align-items: center;
   justify-content: center;
   padding: 24px;
+}
+.modal-backdrop:not([hidden]) {
+  display: flex !important;
 }
 .modal-card {
   width: 560px;

@@ -1,10 +1,10 @@
 """Executes a published workflow DAG.
 
-Materializes workflow templates into concrete tasks, dispatches them via the
-existing message queue / CentralDispatcher pipeline, and collects results
-wave-by-wave in topological order. No LLM decomposition -- goals are pre-rendered
-from templates with parameter substitution, and experience context from prior
-runs is injected so execution agents have historical guidance.
+Materializes workflow templates into concrete tasks within a scenario,
+dispatches them via the existing message queue / CentralDispatcher pipeline,
+and collects results wave-by-wave in topological order. Reuses the scenario
+execution chain for lifecycle tracking instead of maintaining a separate
+workflow execution record.
 """
 import json
 import time
@@ -18,13 +18,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from database.models.scenario import Scenario
 from database.models.task import Task
 from database.models.workflow import Workflow
-from database.models.workflow_execution import WorkflowExecution
 from database.models.workflow_task_template import WorkflowTaskTemplate
 from database.repositories.scenario_repository import ScenarioRepository
 from database.repositories.task_repository import TaskRepository
 from database.repositories.execution_server_repository import ExecutionServerRepository
 from database.repositories.workflow_repository import WorkflowRepository
-from database.repositories.workflow_execution_repository import WorkflowExecutionRepository
 from database.repositories.workflow_task_template_repository import WorkflowTaskTemplateRepository
 from core.message_queue import TaskMessage, mqs
 from core.event_bus import event_bus
@@ -35,7 +33,6 @@ class WorkflowExecutor:
 
     def __init__(self):
         self.workflow_repo = WorkflowRepository()
-        self.execution_repo = WorkflowExecutionRepository()
         self.template_repo = WorkflowTaskTemplateRepository()
         self.task_repo = TaskRepository()
         self.scenario_repo = ScenarioRepository()
@@ -64,58 +61,33 @@ class WorkflowExecutor:
                            f"{', '.join(offline_servers)} — tasks will be deferred "
                            f"until servers reconnect")
 
-        execution_id = str(uuid.uuid4())
-        now = datetime.now()
-        execution = WorkflowExecution(
-            execution_id=execution_id,
-            workflow_id=workflow_id,
-            workflow_version=workflow.version,
-            state="validating",
-            input_params=json.dumps(input_params, ensure_ascii=False),
-            task_results="{}",
-            total_steps=len(templates),
-            completed_steps=0,
-            failed_steps=0,
-            error=None,
-            created_at=now,
-            updated_at=now,
-        )
-        self.execution_repo.create(execution)
+        scenario_id = self._create_execution_scenario(workflow, input_params, created_by)
 
-        self._executor.submit(self._run_execution, execution_id, workflow, templates, input_params)
+        self._executor.submit(self._run_execution, scenario_id, workflow, templates, input_params)
 
         event_bus.emit("workflow.execution_started", {
-            "execution_id": execution_id,
+            "scenario_id": scenario_id,
             "workflow_id": workflow_id,
             "step_count": len(templates),
         })
 
         return {
-            "execution_id": execution_id,
+            "scenario_id": scenario_id,
             "workflow_id": workflow_id,
-            "state": "validating",
+            "state": "running",
             "total_steps": len(templates),
         }
 
-    def _run_execution(self, execution_id: str, workflow: Workflow,
+    def _run_execution(self, scenario_id: str, workflow: Workflow,
                        templates: List[WorkflowTaskTemplate],
                        input_params: Dict[str, Any]) -> None:
         parent_task_id = None
-        scenario_id = None
         try:
-            self.execution_repo.mark_as_running(execution_id)
-
-            scenario_id = self._create_execution_scenario(execution_id, workflow)
-
             step_id_to_task_id, parent_task_id = self._materialize_tasks(
-                scenario_id, execution_id, templates, input_params)
-
-            self.execution_repo.update_scenario_link(
-                execution_id, scenario_id, parent_task_id)
+                scenario_id, workflow.workflow_id, templates, input_params)
 
             waves = self._build_waves(templates)
             replies_by_task_id: Dict[str, dict] = {}
-            task_results: Dict[str, dict] = {}
             completed_count = 0
             failed_count = 0
 
@@ -130,7 +102,7 @@ class WorkflowExecutor:
                         "system_prompt": tmpl.system_prompt or "你是一个有帮助的智能助手。",
                         "question": goal,
                         "is_workflow_task": True,
-                        "workflow_execution_id": execution_id,
+                        "scenario_id": scenario_id,
                     }
 
                     if tmpl.server_id:
@@ -158,11 +130,6 @@ class WorkflowExecutor:
 
                 for reply in replies:
                     replies_by_task_id[reply.task_id] = reply.result
-                    step_id = self._task_id_to_step_id(reply.task_id, step_id_to_task_id)
-                    task_results[step_id] = {
-                        "state": "success" if reply.success else "failed",
-                        "result": reply.result,
-                    }
                     if reply.success:
                         completed_count += 1
                     else:
@@ -174,45 +141,36 @@ class WorkflowExecutor:
                         failed_in_wave, waves, step_id_to_task_id,
                         wave_idx + 1, scenario_id)
 
-                self.execution_repo.update_progress(
-                    execution_id, completed_count, failed_count,
-                    json.dumps(task_results, ensure_ascii=False))
-
             if failed_count > 0:
-                self.execution_repo.mark_as_failed(
-                    execution_id, f"{failed_count} step(s) failed")
                 if parent_task_id:
                     self.task_repo.mark_as_failed(
                         parent_task_id, f"{failed_count} step(s) failed")
                 self.scenario_repo.update_scenario_state(scenario_id, "failed")
                 event_bus.emit("workflow.execution_failed", {
-                    "execution_id": execution_id,
+                    "scenario_id": scenario_id,
                     "workflow_id": workflow.workflow_id,
                     "failed_steps": failed_count,
                 })
             else:
-                self.execution_repo.mark_as_completed(execution_id)
                 if parent_task_id:
                     self.task_repo.mark_as_completed(parent_task_id)
                 self.scenario_repo.update_scenario_state(scenario_id, "completed")
                 event_bus.emit("workflow.execution_completed", {
-                    "execution_id": execution_id,
+                    "scenario_id": scenario_id,
                     "workflow_id": workflow.workflow_id,
                     "completed_steps": completed_count,
                 })
 
-            logger.info(f"Workflow execution {execution_id} finished: "
+            logger.info(f"Workflow execution scenario {scenario_id} finished: "
                         f"{completed_count} completed, {failed_count} failed")
 
         except Exception as e:
-            logger.error(f"Workflow execution {execution_id} error: {e}")
-            self.execution_repo.mark_as_failed(execution_id, str(e))
+            logger.error(f"Workflow execution scenario {scenario_id} error: {e}")
             if parent_task_id:
                 self.task_repo.mark_as_failed(parent_task_id, str(e))
-            if scenario_id:
-                self.scenario_repo.update_scenario_state(scenario_id, "failed")
+            self.scenario_repo.update_scenario_state(scenario_id, "failed")
             event_bus.emit("workflow.execution_failed", {
-                "execution_id": execution_id,
+                "scenario_id": scenario_id,
                 "workflow_id": workflow.workflow_id,
                 "error": str(e),
             })
@@ -254,22 +212,23 @@ class WorkflowExecutor:
                     offline.append(tmpl.server_id)
         return offline
 
-    def _create_execution_scenario(self, execution_id: str, workflow: Workflow) -> str:
+    def _create_execution_scenario(self, workflow: Workflow, input_params: Dict[str, Any],
+                                   created_by: str = None) -> str:
         scenario_id = str(uuid.uuid4())
         now = datetime.now()
         scenario = Scenario(
             scenario_id=scenario_id,
             scenario_type="workflow_execution",
-            name=f"Workflow Execution: {workflow.name} ({execution_id[:8]})",
-            description=f"Auto-created for workflow execution {execution_id}",
+            name=f"Workflow Execution: {workflow.name}",
+            description=f"Auto-created for workflow {workflow.workflow_id}",
             state="running",
             config=json.dumps({
                 "workflow_id": workflow.workflow_id,
-                "execution_id": execution_id,
+                "input_params": input_params,
                 "is_workflow_execution": True,
             }, ensure_ascii=False),
-            context=json.dumps({"trace_id": execution_id}, ensure_ascii=False),
-            created_by=None,
+            context=json.dumps({"trace_id": scenario_id}, ensure_ascii=False),
+            created_by=created_by,
             created_at=now,
             updated_at=now,
             started_at=now,
@@ -277,7 +236,7 @@ class WorkflowExecutor:
         self.scenario_repo.create(scenario)
         return scenario_id
 
-    def _materialize_tasks(self, scenario_id: str, execution_id: str,
+    def _materialize_tasks(self, scenario_id: str, workflow_id: str,
                            templates: List[WorkflowTaskTemplate],
                            input_params: Dict[str, Any]) -> Tuple[Dict[str, str], str]:
         parent_task_id = str(uuid.uuid4())
@@ -285,13 +244,12 @@ class WorkflowExecutor:
         parent_task = Task(
             task_id=parent_task_id,
             scenario_id=scenario_id,
-            goal=f"Workflow execution: {execution_id}",
+            goal=f"Workflow execution: {workflow_id}",
             state="running",
             priority=0,
             timeout_seconds=3600,
             context=json.dumps({
-                "workflow_id": templates[0].workflow_id if templates else "",
-                "execution_id": execution_id,
+                "workflow_id": workflow_id,
                 "is_workflow_task": True,
             }, ensure_ascii=False),
             created_at=now,
@@ -316,7 +274,7 @@ class WorkflowExecutor:
                 "system_prompt": tmpl.system_prompt or "你是一个有帮助的智能助手。",
                 "question": goal,
                 "is_workflow_task": True,
-                "workflow_execution_id": execution_id,
+                "scenario_id": scenario_id,
                 "experience_context": exp_ctx,
             }
             if tmpl.server_id:
@@ -371,13 +329,6 @@ class WorkflowExecutor:
         except (json.JSONDecodeError, TypeError):
             return []
         return [step_id_to_task_id[sid] for sid in dep_step_ids if sid in step_id_to_task_id]
-
-    def _task_id_to_step_id(self, task_id: str,
-                            step_id_to_task_id: Dict[str, str]) -> str:
-        for sid, tid in step_id_to_task_id.items():
-            if tid == task_id:
-                return sid
-        return task_id
 
     def _build_waves(self, templates: List[WorkflowTaskTemplate]) -> List[List[WorkflowTaskTemplate]]:
         by_step = {t.step_id: t for t in templates}

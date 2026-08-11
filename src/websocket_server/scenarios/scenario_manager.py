@@ -229,7 +229,7 @@ class ScenarioManager:
                 cfg["server_id"] = ag["server_id"]
             _create("execution", name, cfg)
 
-    def _wait_for_scenario_tasks(self, scenario_id: str, timeout: int = 60) -> bool:
+    def _wait_for_scenario_tasks(self, scenario_id: str, timeout: int = 3600) -> bool:
         """Wait until all tasks for a scenario reach terminal states.
 
         Ensures subtask DB state is persisted before the scenario lifecycle
@@ -267,7 +267,13 @@ class ScenarioManager:
             # Wait for all subtasks to reach terminal state in DB before
             # marking the scenario done. collect_replies() may return a reply
             # message before finalize_task() finishes updating the subtask row.
-            self._wait_for_scenario_tasks(scenario_id)
+            wait_timeout = config.get("timeout", 3600)
+            if isinstance(wait_timeout, str):
+                try:
+                    wait_timeout = int(wait_timeout)
+                except ValueError:
+                    wait_timeout = 3600
+            self._wait_for_scenario_tasks(scenario_id, timeout=wait_timeout)
 
             if config.get("manual_acceptance"):
                 # Manual acceptance: cycle 1 paused or completed-with-no-tasks.
