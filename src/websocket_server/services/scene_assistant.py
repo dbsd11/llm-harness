@@ -166,6 +166,25 @@ def summarize_scenario(scenario_id: str) -> str:
                          f"{e.get('sender', '')}→{e.get('receiver', '')}：{e.get('content', '')}")
     else:
         lines.append("（暂无对话/事件记录）")
+
+    try:
+        config = json.loads(scenario.config or "{}")
+    except (json.JSONDecodeError, TypeError):
+        config = {}
+    exec_agents = ((config.get("agent_roles") or {}).get("execution_agents") or [])
+    if exec_agents:
+        lines.append("")
+        lines.append("场景执行 Agent 分配（创建 Workflow 时应沿用以下 server_id）：")
+        for a in exec_agents:
+            if isinstance(a, dict):
+                name = a.get("name", "")
+                role = a.get("role", "")
+                sid = a.get("server_id", "")
+                if sid:
+                    lines.append(f"  - {name}（{role}）→ server_id: `{sid}`")
+                else:
+                    lines.append(f"  - {name}（{role}）→ 未指定服务器（本地执行）")
+
     return "\n".join(lines)
 
 
@@ -853,6 +872,11 @@ workflow-spec 格式：
 - 无依赖关系的步骤可以并行执行，提高效率。
 - 为每个角色编写清晰的 `system_prompt`，指导 Agent 完成任务。
 - 使用 `input_schema` 参数化 Workflow，使其可复用于不同输入。
+
+**基于场景创建 Workflow 时的 server_id 规则**：
+- 若用户要求基于某个已有场景创建 Workflow，你**必须**参考【场景聚焦】中的「场景执行 Agent 分配」，将每个执行 Agent 的 `server_id` 原样映射到 Workflow 对应步骤的 `server_id`。
+- 角色对应关系：根据 Agent 名称和角色描述，将场景的 execution_agents 匹配到 Workflow 的 agent_roles 和 steps。
+- 这样可确保 Workflow 的执行服务器与原场景一致，避免执行漂移。
 
 **重要**：当你正在**创建新 Workflow**或**修改已有 Workflow**时，在回复末尾附一个完整的 ```workflow-spec``` 代码块。格式：
 ```workflow-spec
