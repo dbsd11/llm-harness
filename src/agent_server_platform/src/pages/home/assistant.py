@@ -164,6 +164,25 @@ def summarize_scenario(scenario_id: str) -> str:
                          f"{e.get('sender', '')}→{e.get('receiver', '')}：{e.get('content', '')}")
     else:
         lines.append("（暂无对话/事件记录）")
+
+    try:
+        config = json.loads(scenario.config or "{}")
+    except (json.JSONDecodeError, TypeError):
+        config = {}
+    exec_agents = ((config.get("agent_roles") or {}).get("execution_agents") or [])
+    if exec_agents:
+        lines.append("")
+        lines.append("场景执行 Agent 分配（创建 Workflow 时应沿用以下 server_id）：")
+        for a in exec_agents:
+            if isinstance(a, dict):
+                name = a.get("name", "")
+                role = a.get("role", "")
+                sid = a.get("server_id", "")
+                if sid:
+                    lines.append(f"  - {name}（{role}）→ server_id: `{sid}`")
+                else:
+                    lines.append(f"  - {name}（{role}）→ 未指定服务器（本地执行）")
+
     return "\n".join(lines)
 
 
