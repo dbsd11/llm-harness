@@ -8,10 +8,16 @@
 #       scenario_manager.create_scenario（落库前不写任何东西）。
 import json
 import re
+import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.llm_client import llm_client
 from database.repositories.scenario_repository import ScenarioRepository
+from database.repositories.workflow_repository import WorkflowRepository
+from database.repositories.workflow_task_template_repository import WorkflowTaskTemplateRepository
+from database.models.workflow import Workflow
+from database.models.workflow_task_template import WorkflowTaskTemplate
 from core.export_html import build_message_history
 from scenarios.scenario_manager import scenario_manager
 from logger import logger
@@ -39,6 +45,9 @@ _SPEC_FENCE_RE = re.compile(r"```scene-spec\s*(\{.*?\})\s*```", re.DOTALL)
 _MODIFY_KEYWORDS = ("修改", "编辑", "调整", "更新", "变更", "重命名", "改一下", "改成",
                     "modify", "edit", "update", "rename", "change")
 _ID_RE = re.compile(r"(?<![a-zA-Z0-9])([0-9a-fA-F]{4,36})(?![a-zA-Z0-9])")
+
+_WF_SPEC_FENCE_RE = re.compile(r"```workflow-spec\s*(\{.*?\})\s*```", re.DOTALL)
+WF_EMPTY_PREVIEW = "暂无 Workflow 草稿。通过对话描述想创建的 Workflow DAG，草稿会在此预览，确认无误后再保存。"
 
 
 # ── 上下文采集 ─────────────────────────────────────────────────────────────
@@ -336,6 +345,403 @@ def load_scenario_spec(scenario_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
+# ── Workflow 草稿解析 / 校验 / 落库 ──────────────────────────────────────────
+
+def gather_workflow_index() -> str:
+    """返回现有 Workflow 清单文本，注入 system prompt。"""
+    workflows = WorkflowRepository().find_all()
+    if not workflows:
+        return "（当前数据库中没有任何 Workflow）"
+    template_repo = WorkflowTaskTemplateRepository()
+    lines = []
+    for w in workflows:
+        wid = (w.workflow_id or "")[:8]
+        templates = template_repo.find_by_workflow_id(w.workflow_id)
+        step_count = len(templates)
+        lines.append(f"- [{wid}] {w.name or '未命名'} | 状态:{w.state or '?'} | v{w.version or 1} | {step_count} 步")
+    return "\n".join(lines)
+
+
+def summarize_workflow(workflow_id: str) -> str:
+    """把 Workflow 元信息 + DAG 结构压缩为可读文本，供 LLM 回答 Workflow 相关问题。"""
+    repo = WorkflowRepository()
+    wf = repo.find_by_workflow_id(workflow_id)
+    if not wf and len(workflow_id) >= 4:
+        for w in repo.find_all():
+            if (w.workflow_id or "").startswith(workflow_id):
+                wf = w
+                break
+    if not wf:
+        return f"未找到 Workflow：{workflow_id}"
+
+    templates = WorkflowTaskTemplateRepository().find_by_workflow_id(wf.workflow_id)
+    templates.sort(key=lambda t: t.step_order or 0)
+
+    lines = [
+        f"Workflow：{wf.name}  状态：{wf.state}  版本：{wf.version}",
+        f"workflow_id：{wf.workflow_id}",
+    ]
+    if wf.description:
+        lines.append(f"描述：{wf.description}")
+
+    try:
+        input_schema = json.loads(wf.input_schema) if wf.input_schema else {}
+        props = input_schema.get("properties", {})
+        if props:
+            lines.append(f"输入参数：{', '.join(props.keys())}")
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    if templates:
+        lines.append(f"\nDAG 步骤（共 {len(templates)} 步）：")
+        for t in templates:
+            deps = ""
+            try:
+                dep_list = json.loads(t.depends_on) if t.depends_on else []
+                if dep_list:
+                    deps = f" (依赖: {', '.join(dep_list)})"
+            except (json.JSONDecodeError, TypeError):
+                pass
+            server = f" → 服务器: `{t.server_id}`" if t.server_id else ""
+            lines.append(f"  {t.step_id}: [{t.agent_role}] {t.goal_template}{deps}{server}")
+    else:
+        lines.append("（暂无步骤）")
+
+    return "\n".join(lines)
+
+
+def parse_workflow_spec(text: str) -> Optional[Dict[str, Any]]:
+    """从 LLM 回复中抽取 ```workflow-spec {...} ``` 代码块并解析为 dict。无则 None。"""
+    if not text:
+        return None
+    m = _WF_SPEC_FENCE_RE.search(text)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError as e:
+        logger.warning(f"workflow-spec JSON 解析失败: {e}")
+        return None
+
+
+def validate_workflow_spec(spec: Dict[str, Any]) -> Tuple[bool, str]:
+    """校验 Workflow 草稿结构。"""
+    if not isinstance(spec, dict):
+        return False, "草稿不是有效对象。"
+    if not (spec.get("name") or "").strip():
+        return False, "Workflow 名称(name)不能为空。"
+
+    steps = spec.get("steps") or []
+    if not isinstance(steps, list) or not steps:
+        return False, "至少需要一个步骤(step)。"
+
+    agent_roles = spec.get("agent_roles") or {}
+    if not isinstance(agent_roles, dict):
+        return False, "agent_roles 必须是对象。"
+
+    step_ids = set()
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            return False, f"步骤 {i+1} 不是有效对象。"
+        sid = step.get("step_id", "")
+        if not sid:
+            return False, f"步骤 {i+1} 缺少 step_id。"
+        if sid in step_ids:
+            return False, f"step_id 重复：{sid}。"
+        step_ids.add(sid)
+        if not (step.get("goal_template") or "").strip():
+            return False, f"步骤 {sid} 缺少 goal_template。"
+        role = step.get("agent_role", "")
+        if not role:
+            return False, f"步骤 {sid} 缺少 agent_role。"
+        if role not in agent_roles:
+            return False, f"步骤 {sid} 的 agent_role '{role}' 未在 agent_roles 中定义。"
+
+    for step in steps:
+        sid = step.get("step_id", "")
+        deps = step.get("depends_on") or []
+        if not isinstance(deps, list):
+            return False, f"步骤 {sid} 的 depends_on 必须是数组。"
+        for dep in deps:
+            if dep not in step_ids:
+                return False, f"步骤 {sid} 依赖的 {dep} 不存在。"
+
+    if _has_cycle(steps):
+        return False, "步骤之间存在循环依赖，请检查 depends_on。"
+
+    return True, ""
+
+
+def _has_cycle(steps: List[Dict]) -> bool:
+    """检测步骤依赖是否有环（Kahn 拓扑排序）。"""
+    step_ids = {s.get("step_id") for s in steps}
+    in_degree = {s.get("step_id"): 0 for s in steps}
+    adj: Dict[str, List[str]] = {s.get("step_id"): [] for s in steps}
+    for s in steps:
+        sid = s.get("step_id")
+        for dep in (s.get("depends_on") or []):
+            if dep in adj:
+                adj[dep].append(sid)
+                in_degree[sid] = in_degree.get(sid, 0) + 1
+
+    queue = [sid for sid, deg in in_degree.items() if deg == 0]
+    visited = 0
+    while queue:
+        node = queue.pop(0)
+        visited += 1
+        for neighbor in adj.get(node, []):
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    return visited < len(step_ids)
+
+
+def check_workflow_server_id_warnings(spec: Dict[str, Any]) -> str:
+    """检查 workflow steps 中的 server_id 是否匹配已知服务器。"""
+    steps = spec.get("steps") or []
+    used_ids = {s.get("server_id") for s in steps
+                if isinstance(s, dict) and s.get("server_id")}
+    if not used_ids:
+        return ""
+    known = get_known_server_ids()
+    if not known:
+        return ""
+    bad = used_ids - known
+    if bad:
+        return f"⚠️ 以下 server_id 不存在于已注册服务器中：{', '.join(sorted(bad))}。请从【可用执行 Agent 服务器】列表中选择。"
+    return ""
+
+
+def render_workflow_preview(spec: Optional[Dict[str, Any]]) -> str:
+    """把 Workflow 草稿渲染为中文 Markdown 预览。"""
+    if not spec:
+        return WF_EMPTY_PREVIEW
+    lines = ["### Workflow 草稿预览", ""]
+    lines.append(f"- **名称**：{spec.get('name', '')}")
+    if spec.get("description"):
+        lines.append(f"- **描述**：{spec['description']}")
+
+    input_schema = spec.get("input_schema") or {}
+    props = input_schema.get("properties", {})
+    if props:
+        lines.append(f"- **输入参数**：{', '.join(props.keys())}")
+        for pname, pinfo in props.items():
+            if isinstance(pinfo, dict):
+                desc = pinfo.get("description", "")
+                example = pinfo.get("example", "")
+                detail = desc
+                if example:
+                    detail += f"（例: {example}）" if detail else f"例: {example}"
+                if detail:
+                    lines.append(f"  - `{pname}`: {detail}")
+
+    agent_roles = spec.get("agent_roles") or {}
+    if agent_roles:
+        lines.append(f"- **Agent 角色**：")
+        for rname, rinfo in agent_roles.items():
+            if isinstance(rinfo, dict):
+                role_desc = rinfo.get("role", "")
+                lines.append(f"  - `{rname}`: {role_desc}")
+
+    steps = spec.get("steps") or []
+    if steps:
+        lines.append(f"- **DAG 步骤**（{len(steps)} 步）：")
+        for s in steps:
+            if isinstance(s, dict):
+                sid = s.get("step_id", "?")
+                role = s.get("agent_role", "?")
+                goal = s.get("goal_template", "")
+                deps = s.get("depends_on") or []
+                server = s.get("server_id", "")
+                dep_str = f" ← 依赖: {', '.join(deps)}" if deps else ""
+                srv_str = f" → 服务器: `{server}`" if server else ""
+                lines.append(f"  - `{sid}` [{role}]: {goal}{dep_str}{srv_str}")
+
+    ok, err = validate_workflow_spec(spec)
+    sid_warn = check_workflow_server_id_warnings(spec)
+    lines.append("")
+    if sid_warn:
+        lines.append(f"> {sid_warn}")
+    elif ok:
+        lines.append("> ✅ 校验通过，可点「确认保存到数据库」")
+    else:
+        lines.append(f"> ⚠️ {err}")
+    return "\n".join(lines)
+
+
+def save_workflow(spec: Dict[str, Any], workflow_id: str = None) -> Tuple[Optional[str], str]:
+    """校验通过后落库。创建新 Workflow + WorkflowTaskTemplate 记录，或更新已有记录。"""
+    ok, err = validate_workflow_spec(spec)
+    if not ok:
+        return None, err
+    sid_warn = check_workflow_server_id_warnings(spec)
+    if sid_warn:
+        return None, sid_warn
+
+    wf_repo = WorkflowRepository()
+    tpl_repo = WorkflowTaskTemplateRepository()
+    now = datetime.now()
+
+    try:
+        steps = spec.get("steps") or []
+        agent_roles = spec.get("agent_roles") or {}
+        input_schema = spec.get("input_schema") or {}
+
+        dag_definition = json.dumps({"steps": steps}, ensure_ascii=False)
+
+        if workflow_id:
+            existing = _resolve_workflow(workflow_id)
+            if not existing:
+                return None, f"未找到 Workflow：{workflow_id}"
+            full_wf_id = existing.workflow_id
+            new_version = (existing.version or 1) + 1
+            existing.name = spec.get("name", existing.name)
+            existing.description = spec.get("description", existing.description or "")
+            existing.dag_definition = dag_definition
+            existing.input_schema = json.dumps(input_schema, ensure_ascii=False)
+            existing.agent_roles = json.dumps(agent_roles, ensure_ascii=False)
+            existing.version = new_version
+            existing.updated_at = now
+            wf_repo.update(existing)
+
+            tpl_repo.delete_by_workflow_id(full_wf_id)
+            _create_templates(tpl_repo, full_wf_id, steps, agent_roles, now)
+            return full_wf_id, ""
+        else:
+            new_wf_id = str(uuid.uuid4())
+            wf = Workflow(
+                workflow_id=new_wf_id,
+                name=spec.get("name", ""),
+                description=spec.get("description", ""),
+                source_scenario_id="",
+                dag_definition=dag_definition,
+                input_schema=json.dumps(input_schema, ensure_ascii=False),
+                agent_roles=json.dumps(agent_roles, ensure_ascii=False),
+                experience_context="[]",
+                version=1,
+                state="active",
+                created_by="assistant",
+                created_at=now,
+                updated_at=now,
+            )
+            wf_repo.create(wf)
+            _create_templates(tpl_repo, new_wf_id, steps, agent_roles, now)
+            return new_wf_id, ""
+    except Exception as e:
+        logger.error(f"save_workflow 失败: {e}")
+        return None, f"保存失败：{e}"
+
+
+def _create_templates(tpl_repo, workflow_id: str, steps: List[Dict],
+                      agent_roles: Dict, now: datetime):
+    """为 Workflow 创建 WorkflowTaskTemplate 记录。"""
+    for idx, step in enumerate(steps):
+        role_name = step.get("agent_role", "")
+        role_info = agent_roles.get(role_name, {})
+        system_prompt = role_info.get("system_prompt", "") if isinstance(role_info, dict) else ""
+
+        template = WorkflowTaskTemplate(
+            template_id=str(uuid.uuid4()),
+            workflow_id=workflow_id,
+            step_id=step.get("step_id", f"step_{idx+1}"),
+            goal_template=step.get("goal_template", ""),
+            depends_on=json.dumps(step.get("depends_on") or [], ensure_ascii=False),
+            agent_role=role_name,
+            system_prompt=system_prompt,
+            server_id=step.get("server_id", ""),
+            timeout_seconds=step.get("timeout_seconds", 300),
+            input_param_mapping="{}",
+            experience_note="{}",
+            step_order=idx + 1,
+            created_at=now,
+            updated_at=now,
+        )
+        tpl_repo.create(template)
+
+
+def load_workflow_spec(workflow_id: str) -> Optional[Dict[str, Any]]:
+    """从数据库重建 Workflow spec dict。支持前缀匹配。"""
+    wf = _resolve_workflow(workflow_id)
+    if not wf:
+        return None
+
+    try:
+        agent_roles = json.loads(wf.agent_roles) if wf.agent_roles else {}
+    except (json.JSONDecodeError, TypeError):
+        agent_roles = {}
+    try:
+        input_schema = json.loads(wf.input_schema) if wf.input_schema else {}
+    except (json.JSONDecodeError, TypeError):
+        input_schema = {}
+
+    templates = WorkflowTaskTemplateRepository().find_by_workflow_id(wf.workflow_id)
+    templates.sort(key=lambda t: t.step_order or 0)
+
+    steps = []
+    for t in templates:
+        try:
+            deps = json.loads(t.depends_on) if t.depends_on else []
+        except (json.JSONDecodeError, TypeError):
+            deps = []
+        steps.append({
+            "step_id": t.step_id,
+            "goal_template": t.goal_template or "",
+            "depends_on": deps,
+            "agent_role": t.agent_role or "",
+            "server_id": t.server_id or "",
+            "timeout_seconds": t.timeout_seconds or 300,
+        })
+
+    return {
+        "name": wf.name or "",
+        "description": wf.description or "",
+        "input_schema": input_schema,
+        "agent_roles": agent_roles,
+        "steps": steps,
+    }
+
+
+def _resolve_workflow(workflow_id: str):
+    """按完整 id 或前缀解析 Workflow，返回 Workflow 或 None。"""
+    repo = WorkflowRepository()
+    w = repo.find_by_workflow_id(workflow_id)
+    if w:
+        return w
+    if len(workflow_id) >= 4:
+        for c in repo.find_all():
+            if (c.workflow_id or "").startswith(workflow_id):
+                return c
+    return None
+
+
+def _detect_workflow_edit(user_text: str, saved_wf_id: Optional[str],
+                          pending_wf: Optional[Dict[str, Any]]
+                          ) -> Tuple[Optional[str], Optional[str]]:
+    """检测用户是否要修改已有 Workflow。返回 (workflow_id, error)。"""
+    wf_keywords = ("workflow", "工作流", "dag", "流程")
+    has_wf_context = any(k in user_text.lower() for k in wf_keywords)
+    if not user_text or (not any(k in user_text for k in _MODIFY_KEYWORDS) and not has_wf_context):
+        return None, None
+
+    m = _ID_RE.search(user_text)
+    target = m.group(1) if m else saved_wf_id
+    if not target:
+        return None, None
+
+    if saved_wf_id and pending_wf:
+        cur = _resolve_workflow(saved_wf_id)
+        if cur:
+            if (cur.workflow_id == target or cur.workflow_id.startswith(target)
+                    or target.startswith(cur.workflow_id[:len(target)])):
+                return None, None
+
+    wf = _resolve_workflow(target)
+    if not wf:
+        return None, None
+    return wf.workflow_id, None
+
+
 # ── system prompt ──────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """你是一个「场景管理助手」，服务于 Agent Server Platform。你有两种能力：
@@ -395,26 +801,99 @@ config 形状：
 - 系统会在你回复前，把该场景的**全量当前配置**载入【当前草稿】。你**必须基于该全量草稿做修改**，并在回复末尾附上修改后的**完整** scene-spec（不要只给增量、不要丢字段），以保证配置不丢失。
 - 仅 `initializing` 状态的场景可修改；其它状态系统会拒绝并提示，你据实转告用户即可。
 - 修改与创建用的是同一套 scene-spec 格式；不要拒绝修改请求。
-- 用中文回复，简洁友好。"""
+- 用中文回复，简洁友好。
+
+## 4. 管理已有 Workflow
+用户可能问"有哪些 workflow""查看 workflow 配置""总结 workflow"等。
+- Workflow 清单见下方【Workflow 清单】。
+- 查看 Workflow 配置时，使用普通 JSON 格式展示，**不要使用 workflow-spec 代码块**。
+- 若需查看某个 Workflow 的 DAG 结构，下方【Workflow 聚焦】会给出该 Workflow 的步骤详情。
+
+## 5. 创建/修改 Workflow（多轮对话 + 预览）
+通过对话定义一个 Workflow DAG。**Workflow 是可复用的参数化 DAG 任务流**，由多个步骤组成，支持并行和串行依赖。
+
+workflow-spec 格式：
+```
+{
+  "name": "Workflow名称",
+  "description": "可选描述",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "param_name": {"type": "string", "description": "参数说明", "example": "示例值"}
+    },
+    "required": ["param_name"]
+  },
+  "agent_roles": {
+    "role_name": {"role": "角色描述", "system_prompt": "该角色的系统提示词"}
+  },
+  "steps": [
+    {
+      "step_id": "step_1",
+      "goal_template": "任务目标，可使用 {{param_name}} 引用输入参数",
+      "depends_on": [],
+      "agent_role": "role_name",
+      "server_id": "可选，执行服务器 ID",
+      "timeout_seconds": 300
+    }
+  ]
+}
+```
+
+**DAG 规则**：
+- 至少 1 个步骤。每个步骤必须有 `step_id`、`goal_template`、`agent_role`。
+- `depends_on` 是前置步骤的 step_id 列表，空数组表示无依赖（可并行执行）。
+- 不能有循环依赖。
+- `agent_role` 必须在 `agent_roles` 中定义。
+- `server_id` 可选，**必须严格使用【可用执行 Agent 服务器】列表中的 server_id**。
+- `goal_template` 中可使用 `{{参数名}}` 引用 `input_schema` 中定义的输入参数。
+
+**设计 Workflow 的最佳实践**：
+- 将复杂任务分解为多个独立步骤，明确每步的输入输出。
+- 无依赖关系的步骤可以并行执行，提高效率。
+- 为每个角色编写清晰的 `system_prompt`，指导 Agent 完成任务。
+- 使用 `input_schema` 参数化 Workflow，使其可复用于不同输入。
+
+**重要**：当你正在**创建新 Workflow**或**修改已有 Workflow**时，在回复末尾附一个完整的 ```workflow-spec``` 代码块。格式：
+```workflow-spec
+{
+  "name": "...",
+  "agent_roles": { ... },
+  "steps": [ ... ]
+}
+```
+- 草稿在用户点「确认保存」前不会落库。
+- **若用户只是查询、查看 Workflow，绝对不要使用 workflow-spec 代码块**。
+- scene-spec 和 workflow-spec 是不同的东西，不要混淆。创建场景用 scene-spec，创建 Workflow 用 workflow-spec。"""
 
 
 def _build_messages(user_text: str, history: List[Dict[str, Any]],
                     pending_scene: Optional[Dict[str, Any]],
-                    summary_content: Optional[str] = None) -> List[Dict[str, str]]:
+                    summary_content: Optional[str] = None,
+                    pending_workflow: Optional[Dict[str, Any]] = None,
+                    ) -> List[Dict[str, str]]:
     """组装 LLM messages：system（含场景清单/聚焦/当前草稿）+ 历史 + 当前输入。"""
     sys = _SYSTEM_PROMPT
     sys += "\n\n【场景清单】\n" + gather_scene_index()
+    sys += "\n\n【Workflow 清单】\n" + gather_workflow_index()
     sys += "\n\n【可用执行 Agent 服务器】\n" + gather_execution_servers()
     sys += "\n\n【可用人工 Agent 服务器】\n" + gather_human_servers()
 
-    # 若用户输入疑似指向某场景 id，注入聚焦上下文
     focus = _maybe_focus(user_text)
     if focus:
         sys += "\n\n【场景聚焦】\n" + focus
 
+    wf_focus = _maybe_workflow_focus(user_text)
+    if wf_focus:
+        sys += "\n\n【Workflow 聚焦】\n" + wf_focus
+
     if pending_scene:
-        sys += "\n\n【当前草稿（已生成、待确认）】\n```json\n" \
+        sys += "\n\n【当前场景草稿（已生成、待确认）】\n```json\n" \
                + json.dumps(pending_scene, ensure_ascii=False, indent=2) + "\n```"
+
+    if pending_workflow:
+        sys += "\n\n【当前 Workflow 草稿（已生成、待确认）】\n```json\n" \
+               + json.dumps(pending_workflow, ensure_ascii=False, indent=2) + "\n```"
 
     if summary_content:
         sys += f"\n\n【对话历史摘要】\n{summary_content}"
@@ -438,6 +917,22 @@ def _maybe_focus(user_text: str) -> str:
     if not m:
         return ""
     return summarize_scenario(m.group(1))
+
+
+def _maybe_workflow_focus(user_text: str) -> str:
+    """用户输入中若含 workflow 关键词 + 疑似 workflow_id，注入该 Workflow 详情。"""
+    if not user_text:
+        return ""
+    wf_keywords = ("workflow", "工作流", "dag", "流程")
+    if not any(k in user_text.lower() for k in wf_keywords):
+        return ""
+    m = _ID_RE.search(user_text)
+    if not m:
+        return ""
+    wf = _resolve_workflow(m.group(1))
+    if not wf:
+        return ""
+    return summarize_workflow(wf.workflow_id)
 
 
 def _resolve_scenario(scenario_id: str):
@@ -492,33 +987,37 @@ def _detect_edit(user_text: str, saved_id: Optional[str],
 def reply(user_text: str, history: List[Dict[str, Any]],
           pending_scene: Optional[Dict[str, Any]],
           saved_id: Optional[str] = None,
-          summary_content: Optional[str] = None
-          ) -> Tuple[str, Optional[Dict[str, Any]], str, Optional[str]]:
+          summary_content: Optional[str] = None,
+          pending_workflow: Optional[Dict[str, Any]] = None,
+          saved_workflow_id: Optional[str] = None,
+          ) -> Tuple[str, Optional[Dict[str, Any]], str, Optional[str],
+                     Optional[Dict[str, Any]], Optional[str]]:
     """一帧对话。
 
-    返回 (assistant_text, new_pending_scene, preview_md, new_saved_id)。
-    修改已有场景时：载入全量配置到草稿并绑定 saved_id，后续保存走更新。
+    返回 (assistant_text, new_pending_scene, scene_preview_md, new_saved_id,
+          new_pending_workflow, new_saved_workflow_id)。
     """
     if not llm_client.client:
         return ("⚠️ 未配置 LLM（DASHSCOPE_API_KEY 缺失），对话功能不可用。"
-                "请在 .env 配置后重启服务。"), pending_scene, render_preview(pending_scene), saved_id
+                "请在 .env 配置后重启服务。"), pending_scene, render_preview(pending_scene), saved_id, \
+            pending_workflow, saved_workflow_id
 
     new_saved_id = saved_id
     new_pending = pending_scene
+    new_pending_wf = pending_workflow
+    new_saved_wf_id = saved_workflow_id
 
-    # 修改已有场景：先载入全量配置，确保 LLM 基于完整草稿修改（不丢字段）
+    # 修改已有场景：先载入全量配置
     target, err = _detect_edit(user_text, saved_id, pending_scene)
     if err and err.startswith("non-initializing"):
         state = err.split(":", 1)[1]
         return (f"⚠️ 该场景当前状态为「{state}」，仅 `initializing` 状态的场景可修改。"
                 "如需调整，请先在 Scenario Dashboard 停止/重建场景。"), \
-            pending_scene, render_preview(pending_scene), saved_id
+            pending_scene, render_preview(pending_scene), saved_id, \
+            pending_workflow, saved_workflow_id
 
-    # 检查用户是否在查看现有场景（包含场景 ID 但不是修改意图）
-    # 只有当匹配到的文本确实是一个有效的场景 ID 时，才认为是查看场景
     match = _ID_RE.search(user_text)
     if match and not target:
-        # 检查匹配到的文本是否真的是一个场景 ID
         potential_id = match.group(1)
         scenario_repo = ScenarioRepository()
         is_real_scenario = scenario_repo.find_by_scenario_id(potential_id) is not None
@@ -532,23 +1031,42 @@ def reply(user_text: str, history: List[Dict[str, Any]],
             new_pending = loaded
             new_saved_id = target
 
-    messages = _build_messages(user_text, history, new_pending, summary_content)
+    # 修改已有 Workflow：载入全量配置
+    wf_target, wf_err = _detect_workflow_edit(user_text, saved_workflow_id, pending_workflow)
+    if wf_target and not wf_err:
+        loaded_wf = load_workflow_spec(wf_target)
+        if loaded_wf:
+            new_pending_wf = loaded_wf
+            new_saved_wf_id = wf_target
+
+    messages = _build_messages(user_text, history, new_pending, summary_content,
+                               pending_workflow=new_pending_wf)
     raw = llm_client.chat(messages, 0.7)
     if not raw:
-        return "（助手暂时没有响应，请重试。）", new_pending, render_preview(new_pending), new_saved_id
+        return "（助手暂时没有响应，请重试。）", new_pending, render_preview(new_pending), new_saved_id, \
+            new_pending_wf, new_saved_wf_id
+
+    visible = raw
 
     # 抽取并剥离 scene-spec 代码块
     spec = parse_scene_spec(raw)
-    visible = raw
     if spec is not None:
         ok, _ = validate_scene_spec(spec)
-        # 只有当用户正在创建新场景或修改现有场景时，才将 scene-spec 作为草稿
-        # 如果只是查看场景配置，不应该设置 pending，避免显示预览
         if not is_viewing_scene:
             if ok or spec.get("scenario_type"):
                 new_pending = spec
-        visible = _SPEC_FENCE_RE.sub("", raw).strip()
-    return visible, new_pending, render_preview(new_pending), new_saved_id
+        visible = _SPEC_FENCE_RE.sub("", visible).strip()
+
+    # 抽取并剥离 workflow-spec 代码块
+    wf_spec = parse_workflow_spec(visible)
+    if wf_spec is not None:
+        ok_wf, _ = validate_workflow_spec(wf_spec)
+        if ok_wf or wf_spec.get("steps"):
+            new_pending_wf = wf_spec
+        visible = _WF_SPEC_FENCE_RE.sub("", visible).strip()
+
+    return visible, new_pending, render_preview(new_pending), new_saved_id, \
+        new_pending_wf, new_saved_wf_id
 
 
 # ── SceneAssistant 类（依赖注入，便于测试） ──────────────────────────────────
@@ -568,7 +1086,7 @@ class SceneAssistant:
               summary_content: Optional[str] = None) -> str:
         pending_scene = self._repo.find_pending_scene(session_id)
         messages = _build_messages(user_text, history or [], pending_scene,
-                                   summary_content)
+                                   summary_content, pending_workflow=None)
         return self._llm.chat(messages)
 
 
@@ -677,3 +1195,59 @@ if __name__ == "__main__":
         globals()["scenario_manager"] = _real_sm
 
     print("assistant self-check OK")
+
+    # ── Workflow self-check ──
+    good_wf = {
+        "name": "研究 Workflow",
+        "description": "多步研究流程",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string", "description": "研究主题"}
+            },
+            "required": ["topic"]
+        },
+        "agent_roles": {
+            "researcher": {"role": "研究员", "system_prompt": "你是研究员"},
+            "writer": {"role": "写手", "system_prompt": "你是写手"}
+        },
+        "steps": [
+            {"step_id": "step_1", "goal_template": "研究 {{topic}}", "depends_on": [],
+             "agent_role": "researcher", "timeout_seconds": 300},
+            {"step_id": "step_2", "goal_template": "撰写报告", "depends_on": ["step_1"],
+             "agent_role": "writer", "timeout_seconds": 300},
+        ]
+    }
+    ok_wf, err_wf = validate_workflow_spec(good_wf)
+    assert ok_wf, f"合法 workflow 应通过校验: {err_wf}"
+
+    bad_wf_no_name = {**good_wf, "name": ""}
+    ok_n, err_n = validate_workflow_spec(bad_wf_no_name)
+    assert not ok_n and "名称" in err_n, f"缺名称应报错: {err_n}"
+
+    bad_wf_no_steps = {**good_wf, "steps": []}
+    ok_s, err_s = validate_workflow_spec(bad_wf_no_steps)
+    assert not ok_s and "步骤" in err_s, f"缺步骤应报错: {err_s}"
+
+    bad_wf_cycle = {**good_wf, "steps": [
+        {"step_id": "a", "goal_template": "x", "depends_on": ["b"], "agent_role": "researcher"},
+        {"step_id": "b", "goal_template": "y", "depends_on": ["a"], "agent_role": "writer"},
+    ]}
+    ok_c, err_c = validate_workflow_spec(bad_wf_cycle)
+    assert not ok_c and "循环" in err_c, f"循环依赖应报错: {err_c}"
+
+    bad_wf_role = {**good_wf, "steps": [
+        {"step_id": "s1", "goal_template": "x", "depends_on": [], "agent_role": "nonexistent"},
+    ]}
+    ok_r, err_r = validate_workflow_spec(bad_wf_role)
+    assert not ok_r and "agent_role" in err_r, f"无效角色应报错: {err_r}"
+
+    wf_sample = ("好的，帮你创建 Workflow。\n```workflow-spec\n"
+                 + json.dumps(good_wf, ensure_ascii=False) + "\n```\n请确认。")
+    parsed_wf = parse_workflow_spec(wf_sample)
+    assert parsed_wf and parsed_wf["name"] == "研究 Workflow", "应从回复中解析出 workflow-spec"
+
+    wf_md = render_workflow_preview(good_wf)
+    assert "✅" in wf_md and "研究员" in wf_md, f"预览应含通过标记: {wf_md}"
+
+    print("workflow self-check OK")

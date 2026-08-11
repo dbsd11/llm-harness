@@ -129,13 +129,17 @@ class APIClient:
     def chat(self, message: str, session_id: str = "default",
              history: List[Dict[str, str]] = None,
              scene_id: str = None,
-             pending_scene: dict = None) -> dict:
+             pending_scene: dict = None,
+             pending_workflow: dict = None,
+             workflow_id: str = None) -> dict:
         return self._post("/api/chat", {
             "message": message,
             "session_id": session_id,
             "history": history or [],
             "scene_id": scene_id,
             "pending_scene": pending_scene,
+            "pending_workflow": pending_workflow,
+            "workflow_id": workflow_id,
         })
 
     def chat_save(self, scene_spec: dict, session_id: str = "default",
@@ -158,6 +162,20 @@ class APIClient:
 
     def chat_scene_index(self) -> dict:
         return self._get("/api/chat/scene-index")
+
+    def chat_workflow_save(self, workflow_spec: dict, session_id: str = "default",
+                           workflow_id: str = None) -> dict:
+        return self._post("/api/chat/workflow/save", {
+            "workflow_spec": workflow_spec,
+            "session_id": session_id,
+            "workflow_id": workflow_id,
+        })
+
+    def chat_workflow_index(self) -> dict:
+        return self._get("/api/chat/workflow-index")
+
+    def chat_load_workflow(self, workflow_id: str) -> dict:
+        return self._get("/api/chat/load-workflow", {"workflow_id": workflow_id})
 
     # ── events ────────────────────────────────────────────────────────────
 

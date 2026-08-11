@@ -139,6 +139,9 @@ def create_page(global_state_component):
         pending_state = gr.State(value=None)
         saved_id_state = gr.State(value=None)
         dirty_state = gr.State(value=False)
+        pending_wf_state = gr.State(value=None)
+        saved_wf_id_state = gr.State(value=None)
+        wf_dirty_state = gr.State(value=False)
 
         fab_btn = gr.Button("💬", elem_classes="fab")
 
@@ -167,6 +170,11 @@ def create_page(global_state_component):
                 with gr.Row(visible=False) as draft_actions:
                     confirm_btn = gr.Button("✅ 确认保存到数据库", variant="primary")
                     discard_btn = gr.Button("放弃草稿")
+
+                wf_preview_md = gr.Markdown("暂无 Workflow 草稿。", visible=False)
+                with gr.Row(visible=False) as wf_draft_actions:
+                    wf_confirm_btn = gr.Button("✅ 确认保存 Workflow", variant="primary")
+                    wf_discard_btn = gr.Button("放弃 Workflow 草稿")
 
         # ── Dashboard data loading (via ws_server API) ────────────────
 
@@ -280,6 +288,48 @@ def create_page(global_state_component):
                 gr.update(visible=show_actions),
             )
 
+        def _wf_draft_updates(pending_wf, wf_dirty):
+            show_actions = bool(pending_wf) and wf_dirty
+            if pending_wf and isinstance(pending_wf, dict):
+                wf_preview = _render_wf_preview(pending_wf)
+            else:
+                wf_preview = "暂无 Workflow 草稿。"
+            return (
+                gr.update(visible=bool(pending_wf), value=wf_preview),
+                gr.update(visible=show_actions),
+            )
+
+        def _render_wf_preview(pending_wf):
+            """Render workflow-spec draft as markdown preview."""
+            if not pending_wf or not isinstance(pending_wf, dict):
+                return "暂无 Workflow 草稿。"
+            lines = ["### Workflow 草稿预览", ""]
+            lines.append(f"- **名称**：{pending_wf.get('name', '')}")
+            if pending_wf.get("description"):
+                lines.append(f"- **描述**：{pending_wf['description']}")
+            input_schema = pending_wf.get("input_schema") or {}
+            props = input_schema.get("properties", {})
+            if props:
+                lines.append(f"- **输入参数**：{', '.join(props.keys())}")
+            agent_roles = pending_wf.get("agent_roles") or {}
+            if agent_roles:
+                lines.append("- **Agent 角色**：")
+                for rname, rinfo in agent_roles.items():
+                    if isinstance(rinfo, dict):
+                        lines.append(f"  - `{rname}`: {rinfo.get('role', '')}")
+            steps = pending_wf.get("steps") or []
+            if steps:
+                lines.append(f"- **DAG 步骤**（{len(steps)} 步）：")
+                for s in steps:
+                    if isinstance(s, dict):
+                        sid = s.get("step_id", "?")
+                        role = s.get("agent_role", "?")
+                        goal = s.get("goal_template", "")
+                        deps = s.get("depends_on") or []
+                        dep_str = f" ← {','.join(deps)}" if deps else ""
+                        lines.append(f"  - `{sid}` [{role}]: {goal}{dep_str}")
+            return "\n".join(lines)
+
         # ── Chat handlers ────────────────────────────────────────────
 
         def on_delete_from_menu(index_str):
@@ -292,11 +342,14 @@ def create_page(global_state_component):
             except (ValueError, TypeError):
                 return []
 
-        def on_send(user_text, chatbot_history, pending, dirty, saved_id):
+        def on_send(user_text, chatbot_history, pending, dirty, saved_id,
+                     pending_wf, wf_dirty, saved_wf_id):
             user_text = (user_text or "").strip()
             if not user_text:
                 pv, act = _draft_updates(pending, dirty)
-                return chatbot_history, pending, dirty, saved_id, pv, act, gr.update()
+                wv, wact = _wf_draft_updates(pending_wf, wf_dirty)
+                return (chatbot_history, pending, dirty, saved_id, pv, act, gr.update(),
+                        pending_wf, wf_dirty, saved_wf_id, wv, wact)
 
             # Compress if needed
             if compress_if_needed(SESSION_ID, msg_repo, llm_client):
@@ -319,12 +372,16 @@ def create_page(global_state_component):
                 history=history_for_api,
                 scene_id=saved_id,
                 pending_scene=pending,
+                pending_workflow=pending_wf,
+                workflow_id=saved_wf_id,
             )
 
             assistant_text = resp.get("reply", "（助手暂时没有响应，请重试。）")
             new_pending = resp.get("pending_scene", pending)
             new_saved_id = resp.get("scene_id", saved_id)
-            preview_text = resp.get("preview", _render_preview(new_pending))
+
+            new_pending_wf = resp.get("pending_workflow", pending_wf)
+            new_saved_wf_id = resp.get("workflow_id", saved_wf_id)
 
             history.append({"role": "assistant", "content": assistant_text})
             assistant_msg_id = save_message("assistant", assistant_text)
@@ -335,7 +392,14 @@ def create_page(global_state_component):
             loaded_existing = bool(new_saved_id) and (new_saved_id != saved_id)
             new_dirty = dirty or changed or loaded_existing
             pv, act = _draft_updates(new_pending, new_dirty)
-            return history, new_pending, new_dirty, new_saved_id, pv, act, ""
+
+            wf_changed = new_pending_wf is not None and new_pending_wf != pending_wf
+            wf_loaded = bool(new_saved_wf_id) and (new_saved_wf_id != saved_wf_id)
+            new_wf_dirty = wf_dirty or wf_changed or wf_loaded
+            wv, wact = _wf_draft_updates(new_pending_wf, new_wf_dirty)
+
+            return (history, new_pending, new_dirty, new_saved_id, pv, act, "",
+                    new_pending_wf, new_wf_dirty, new_saved_wf_id, wv, wact)
 
         def on_confirm(chatbot_history, pending, saved_id, dirty):
             history = list(chatbot_history or [])
@@ -371,6 +435,39 @@ def create_page(global_state_component):
             pv, act = _draft_updates(None, False)
             return history, None, None, False, pv, act
 
+        def on_wf_confirm(chatbot_history, pending_wf, saved_wf_id, wf_dirty):
+            history = list(chatbot_history or [])
+            if not pending_wf or not wf_dirty:
+                history.append({"role": "assistant",
+                               "content": "⚠️ 当前没有未保存的 Workflow 修改。先通过对话调整吧。"})
+                wv, wact = _wf_draft_updates(pending_wf, wf_dirty)
+                return history, pending_wf, saved_wf_id, wf_dirty, wv, wact
+
+            resp = api_client.chat_workflow_save(
+                workflow_spec=pending_wf,
+                session_id=SESSION_ID,
+                workflow_id=saved_wf_id,
+            )
+            if resp.get("success"):
+                action = "已更新" if saved_wf_id else "已创建"
+                wid = resp.get("workflow_id", "")
+                history.append({"role": "assistant",
+                               "content": (f"✅ Workflow {action}！`workflow_id={wid[:8]}`\n\n"
+                                           "可到「Workflow DAG Management」查看或执行。")})
+                wv, wact = _wf_draft_updates(None, False)
+                return history, None, wid, False, wv, wact
+            history.append({"role": "assistant",
+                           "content": f"❌ Workflow 保存失败：{resp.get('error', 'Unknown')}\n草稿已保留。"})
+            wv, wact = _wf_draft_updates(pending_wf, wf_dirty)
+            return history, pending_wf, saved_wf_id, wf_dirty, wv, wact
+
+        def on_wf_discard(chatbot_history, pending_wf, saved_wf_id):
+            history = list(chatbot_history or [])
+            history.append({"role": "assistant",
+                           "content": "已放弃当前 Workflow 草稿。"})
+            wv, wact = _wf_draft_updates(None, False)
+            return history, None, None, False, wv, wact
+
         # ── Page load + wiring ───────────────────────────────────────
         def on_page_load():
             return load_history()
@@ -387,13 +484,25 @@ def create_page(global_state_component):
                 return delete_message_by_id(msg_id, chatbot_history)
             return chatbot_history
 
-        send_outputs = [chatbot, pending_state, dirty_state, saved_id_state, preview_md, draft_actions, user_input]
-        send_inputs = [user_input, chatbot, pending_state, dirty_state, saved_id_state]
+        send_outputs = [chatbot, pending_state, dirty_state, saved_id_state,
+                        preview_md, draft_actions, user_input,
+                        pending_wf_state, wf_dirty_state, saved_wf_id_state,
+                        wf_preview_md, wf_draft_actions]
+        send_inputs = [user_input, chatbot, pending_state, dirty_state, saved_id_state,
+                       pending_wf_state, wf_dirty_state, saved_wf_id_state]
         send_btn.click(on_send, send_inputs, send_outputs)
         confirm_btn.click(on_confirm, [chatbot, pending_state, saved_id_state, dirty_state],
                           [chatbot, pending_state, saved_id_state, dirty_state, preview_md, draft_actions])
         discard_btn.click(on_discard, [chatbot, pending_state, saved_id_state],
                           [chatbot, pending_state, saved_id_state, dirty_state, preview_md, draft_actions])
+        wf_confirm_btn.click(on_wf_confirm,
+                             [chatbot, pending_wf_state, saved_wf_id_state, wf_dirty_state],
+                             [chatbot, pending_wf_state, saved_wf_id_state, wf_dirty_state,
+                              wf_preview_md, wf_draft_actions])
+        wf_discard_btn.click(on_wf_discard,
+                             [chatbot, pending_wf_state, saved_wf_id_state],
+                             [chatbot, pending_wf_state, saved_wf_id_state, wf_dirty_state,
+                              wf_preview_md, wf_draft_actions])
 
         page.load(on_page_load, outputs=[chatbot])
 

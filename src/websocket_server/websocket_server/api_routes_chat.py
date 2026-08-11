@@ -10,6 +10,8 @@ from logger import logger
 from services.scene_assistant import (
     reply, render_preview, save_scene, parse_scene_spec,
     load_scenario_spec, gather_scene_index, SceneAssistant,
+    parse_workflow_spec, save_workflow, render_workflow_preview,
+    load_workflow_spec, gather_workflow_index,
 )
 from services.compression import should_compress, build_summary_prompt
 from database.repositories.assistant_message_repository import AssistantMessageRepository
@@ -37,6 +39,8 @@ async def chat(request: web.Request) -> web.Response:
     history = payload.get("history", [])
     saved_id = payload.get("scene_id")
     pending_scene = payload.get("pending_scene")
+    pending_workflow = payload.get("pending_workflow")
+    saved_workflow_id = payload.get("workflow_id")
 
     if not user_text.strip():
         return web.json_response({"success": False, "error": "message is required"}, status=400)
@@ -70,8 +74,10 @@ async def chat(request: web.Request) -> web.Response:
                         summary_content = summary_obj.content
 
         # Call assistant logic (reply 内部含同步 LLM 调用，整体放 LLM 线程池)
-        visible, new_pending, preview_md, new_saved_id = await run_in_llm_thread(
-            reply, user_text, history, pending_scene, saved_id, summary_content
+        visible, new_pending, preview_md, new_saved_id, \
+            new_pending_wf, new_saved_wf_id = await run_in_llm_thread(
+            reply, user_text, history, pending_scene, saved_id, summary_content,
+            pending_workflow, saved_workflow_id
         )
 
         # Save assistant reply
@@ -80,6 +86,9 @@ async def chat(request: web.Request) -> web.Response:
         # Parse scene spec from reply
         spec = parse_scene_spec(visible)
 
+        # Parse workflow spec from reply
+        wf_spec = parse_workflow_spec(visible)
+
         return web.json_response({
             "success": True,
             "reply": visible,
@@ -87,6 +96,10 @@ async def chat(request: web.Request) -> web.Response:
             "scene_spec": spec,
             "pending_scene": new_pending,
             "scene_id": new_saved_id,
+            "pending_workflow": new_pending_wf,
+            "workflow_id": new_saved_wf_id,
+            "workflow_spec": wf_spec,
+            "workflow_preview": render_workflow_preview(new_pending_wf),
             "session_id": session_id,
         })
     except Exception as e:
@@ -177,9 +190,75 @@ async def chat_scene_index(request: web.Request) -> web.Response:
     return web.json_response({"success": True, "scene_index": index})
 
 
+async def chat_workflow_save(request: web.Request) -> web.Response:
+    """Persist a workflow-spec draft to database."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"success": False, "error": "Invalid JSON"}, status=400)
+
+    spec = payload.get("workflow_spec") or payload.get("pending_workflow")
+    session_id = payload.get("session_id", "default")
+    workflow_id = payload.get("workflow_id")
+
+    if not spec or not isinstance(spec, dict):
+        return web.json_response({"success": False, "error": "workflow_spec is required"}, status=400)
+
+    try:
+        saved_id, error = await run_in_db_thread(save_workflow, spec, workflow_id)
+        if error:
+            return web.json_response({"success": False, "error": error}, status=400)
+
+        ws_server = request.app.get("ws_server")
+        if ws_server:
+            evt_type = "workflow_updated" if workflow_id else "workflow_published"
+            await ws_server._broadcast_event(evt_type, {
+                "workflow_id": saved_id,
+                "name": spec.get("name", ""),
+            })
+
+        msg_repo = AssistantMessageRepository()
+        action = "更新" if workflow_id else "创建"
+        await run_in_db_thread(
+            msg_repo.save, "assistant",
+            f"✅ Workflow 已{action}保存（ID: {saved_id[:8]}...）", session_id,
+        )
+
+        return web.json_response({
+            "success": True,
+            "workflow_id": saved_id,
+            "message": f"Workflow 已{'更新' if workflow_id else '创建'}",
+        })
+    except Exception as e:
+        logger.error(f"Chat workflow save error: {e}")
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
+
+async def chat_workflow_index(request: web.Request) -> web.Response:
+    """Get workflow index for the assistant."""
+    index = await run_in_db_thread(gather_workflow_index)
+    return web.json_response({"success": True, "workflow_index": index})
+
+
+async def chat_load_workflow(request: web.Request) -> web.Response:
+    """Load an existing workflow's spec for editing."""
+    workflow_id = request.query.get("workflow_id")
+    if not workflow_id:
+        return web.json_response({"success": False, "error": "workflow_id is required"}, status=400)
+
+    spec = await run_in_db_thread(load_workflow_spec, workflow_id)
+    if not spec:
+        return web.json_response({"success": False, "error": "Workflow not found"}, status=404)
+
+    return web.json_response({"success": True, "workflow_spec": spec})
+
+
 def register_chat_routes(app: web.Application) -> None:
     app.router.add_post("/api/chat", chat)
     app.router.add_post("/api/chat/save", chat_save)
+    app.router.add_post("/api/chat/workflow/save", chat_workflow_save)
     app.router.add_get("/api/chat/preview", chat_preview)
     app.router.add_get("/api/chat/load-scene", chat_load_scene)
     app.router.add_get("/api/chat/scene-index", chat_scene_index)
+    app.router.add_get("/api/chat/workflow-index", chat_workflow_index)
+    app.router.add_get("/api/chat/load-workflow", chat_load_workflow)
