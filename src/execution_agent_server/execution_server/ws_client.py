@@ -17,6 +17,7 @@ class WSClient:
         self.cfg = cfg
         self.loop = asyncio.new_event_loop()
         self._ws = None
+        self._api_key = cfg.get("api_key", "")
         self.task_runner = None  # set by run()
         self._stop = threading.Event()
 
@@ -43,7 +44,8 @@ class WSClient:
                 logger.info(f"Connecting to backend WS: {url}")
                 # wss:// 自签名证书：客户端跳过校验；ws:// 不传 ssl
                 _ssl = ssl._create_unverified_context() if url.startswith("wss") else None
-                async with websockets.connect(url, max_size=None, ssl=_ssl) as ws:
+                _headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
+                async with websockets.connect(url, max_size=None, ssl=_ssl, extra_headers=_headers) as ws:
                     self._ws = ws
                     await ws.send(P.register_frame(
                         self.cfg["server_id"],

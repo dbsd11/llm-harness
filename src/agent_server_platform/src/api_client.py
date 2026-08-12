@@ -17,6 +17,13 @@ class APIClient:
 
     def __init__(self):
         self.base_url = os.getenv("WS_SERVER_API_URL", "https://agent-socket-server.bdzz.com.cn:8765")
+        self.api_key = os.getenv("WS_SERVER_API_KEY", "")
+
+    @property
+    def _headers(self) -> Dict[str, str]:
+        if self.api_key:
+            return {"Authorization": f"Bearer {self.api_key}"}
+        return {}
 
     @staticmethod
     def _extract_error(e: Exception) -> str:
@@ -31,7 +38,8 @@ class APIClient:
 
     def _get(self, path: str, params: Dict[str, Any] = None) -> dict:
         try:
-            resp = requests.get(f"{self.base_url}{path}", params=params, timeout=10, verify=False)
+            resp = requests.get(f"{self.base_url}{path}", params=params,
+                                headers=self._headers, timeout=10, verify=False)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
@@ -42,6 +50,7 @@ class APIClient:
               timeout: int = 180) -> dict:
         try:
             resp = requests.post(f"{self.base_url}{path}", json=data or {},
+                                 headers=self._headers,
                                  timeout=timeout, verify=False)
             resp.raise_for_status()
             return resp.json()
@@ -51,7 +60,8 @@ class APIClient:
 
     def _delete(self, path: str) -> dict:
         try:
-            resp = requests.delete(f"{self.base_url}{path}", timeout=10, verify=False)
+            resp = requests.delete(f"{self.base_url}{path}",
+                                   headers=self._headers, timeout=10, verify=False)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
@@ -61,6 +71,7 @@ class APIClient:
     def _put(self, path: str, data: Dict[str, Any] = None) -> dict:
         try:
             resp = requests.put(f"{self.base_url}{path}", json=data or {},
+                                headers=self._headers,
                                 timeout=10, verify=False)
             resp.raise_for_status()
             return resp.json()

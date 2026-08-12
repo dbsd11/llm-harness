@@ -19,6 +19,7 @@ def load_config() -> dict:
 
         # Backend WebSocket connection
         "backend_ws_url": os.getenv("BACKEND_WS_URL", "wss://agent-socket-server.bdzz.com.cn:8765"),
+        "api_key": os.getenv("WS_SERVER_API_KEY", ""),
 
         # LLM configuration
         "dashscope_api_key": os.getenv("DASHSCOPE_API_KEY"),

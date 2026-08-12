@@ -18,6 +18,7 @@ class WSEventSubscriber:
         # not agent task frames. If the env var omits the path, add it.
         if not self.ws_url.endswith("/subscribe"):
             self.ws_url = self.ws_url.rstrip("/") + "/subscribe"
+        self.api_key = os.getenv("WS_SERVER_API_KEY", "")
         self.task_repo = TaskRepository()
         self.event_repo = EventRepository()
         self._loop = None
@@ -59,7 +60,8 @@ class WSEventSubscriber:
             try:
                 logger.info(f"连接到 WS 订阅端点: {self.ws_url}")
                 _ssl = ssl._create_unverified_context() if self.ws_url.startswith("wss") else None
-                async with websockets.connect(self.ws_url, ssl=_ssl) as ws:
+                _headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else None
+                async with websockets.connect(self.ws_url, ssl=_ssl, extra_headers=_headers) as ws:
                     self._ws = ws
                     backoff = 1
                     logger.info("WS 订阅已连接")

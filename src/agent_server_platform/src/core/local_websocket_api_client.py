@@ -9,6 +9,13 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 远程 WebSocket Server API 地址 (wss 服务端 REST 走 https)
 WS_SERVER_API_URL = os.getenv("WS_SERVER_API_URL", "https://agent-socket-server.bdzz.com.cn:8765")
+WS_SERVER_API_KEY = os.getenv("WS_SERVER_API_KEY", "")
+
+
+def _auth_headers():
+    if WS_SERVER_API_KEY:
+        return {"Authorization": f"Bearer {WS_SERVER_API_KEY}"}
+    return {}
 
 
 def _make_request(method, endpoint, **kwargs):
@@ -16,7 +23,11 @@ def _make_request(method, endpoint, **kwargs):
     url = f"{WS_SERVER_API_URL}{endpoint}"
     try:
         kwargs.setdefault("verify", False)  # 自签名证书，跳过校验
-        response = requests.request(method, url, timeout=5, **kwargs)
+        kwargs.setdefault("timeout", 5)
+        headers = _auth_headers()
+        if "headers" in kwargs:
+            headers.update(kwargs.pop("headers"))
+        response = requests.request(method, url, headers=headers, **kwargs)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:

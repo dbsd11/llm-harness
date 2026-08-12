@@ -24,5 +24,6 @@ def load_sandbox_config() -> dict:
 
         # Backend configuration (for exec-server to connect back)
         "backend_ws_url": os.getenv("SANDBOX_BACKEND_WS_URL", "ws://localhost:8765"),
+        "api_key": os.getenv("WS_SERVER_API_KEY", ""),
         "heartbeat_interval": int(os.getenv("SANDBOX_HEARTBEAT_INTERVAL", "5")),
     }

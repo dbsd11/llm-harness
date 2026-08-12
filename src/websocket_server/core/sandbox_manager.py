@@ -30,6 +30,7 @@ class SandboxManager:
         self.docker_image = config["docker_image"]
         self.default_quota = config["default_quota"]
         self.backend_ws_url = config["backend_ws_url"]
+        self.api_key = config.get("api_key", "")
         self.heartbeat_interval = config["heartbeat_interval"]
 
         # In-memory sandbox tracking: server_id -> sandbox_info
@@ -80,6 +81,8 @@ class SandboxManager:
             "HEARTBEAT_INTERVAL": str(self.heartbeat_interval),
             "EVENT_PERSIST_DISABLED": "1",
         }
+        if self.api_key:
+            env_vars["WS_SERVER_API_KEY"] = self.api_key
 
         # Build docker run command with data volume mount
         env_args = " ".join([f'-e {k}="{v}"' for k, v in env_vars.items()])

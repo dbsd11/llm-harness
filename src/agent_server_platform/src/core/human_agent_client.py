@@ -32,6 +32,7 @@ class HumanAgentClient:
         self._ws_url = os.getenv("WS_SERVER_WS_URL", "wss://agent-socket-server.bdzz.com.cn:8765")
         self._ws_url = self._ws_url.replace("/subscribe", "")
         self._heartbeat_interval = int(os.getenv("HUMAN_HEARTBEAT_INTERVAL", "5"))
+        self._api_key = os.getenv("WS_SERVER_API_KEY", "")
 
         self._loop = None
         self._task = None
@@ -119,8 +120,10 @@ class HumanAgentClient:
         while self._running:
             try:
                 logger.info(f"HumanAgentClient connecting to {self._ws_url}")
+                _headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
                 async with websockets.connect(
                     self._ws_url, max_size=None, ssl=_ssl,
+                    extra_headers=_headers,
                 ) as ws:
                     self._ws = ws
                     backoff = 1
