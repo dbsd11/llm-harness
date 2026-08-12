@@ -61,7 +61,8 @@ class WorkflowExecutor:
                            f"{', '.join(offline_servers)} — tasks will be deferred "
                            f"until servers reconnect")
 
-        scenario_id = self._create_execution_scenario(workflow, input_params, created_by)
+        source_config = self._load_source_scenario_config(workflow.source_scenario_id)
+        scenario_id = self._create_execution_scenario(workflow, input_params, created_by, source_config)
 
         self._executor.submit(self._run_execution, scenario_id, workflow, templates, input_params)
 
@@ -212,21 +213,52 @@ class WorkflowExecutor:
                     offline.append(tmpl.server_id)
         return offline
 
+    def _load_source_scenario_config(self, source_scenario_id: str) -> Dict[str, Any]:
+        """Load timeout and manual_acceptance from source scenario config.
+        
+        Always reads from the source scenario at execution time, so any updates
+        to the source scenario config will be reflected in new workflow executions.
+        """
+        if not source_scenario_id:
+            return {}
+        
+        source_scenario = self.scenario_repo.find_by_scenario_id(source_scenario_id)
+        if not source_scenario or not source_scenario.config:
+            return {}
+        
+        try:
+            config = json.loads(source_scenario.config)
+            return {
+                "timeout": config.get("timeout"),
+                "manual_acceptance": config.get("manual_acceptance"),
+            }
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
     def _create_execution_scenario(self, workflow: Workflow, input_params: Dict[str, Any],
-                                   created_by: str = None) -> str:
+                                   created_by: str = None, source_config: Dict[str, Any] = None) -> str:
         scenario_id = str(uuid.uuid4())
         now = datetime.now()
+        
+        scenario_config = {
+            "workflow_id": workflow.workflow_id,
+            "input_params": input_params,
+            "is_workflow_execution": True,
+        }
+        
+        if source_config:
+            if source_config.get("timeout") is not None:
+                scenario_config["timeout"] = source_config["timeout"]
+            if source_config.get("manual_acceptance") is not None:
+                scenario_config["manual_acceptance"] = source_config["manual_acceptance"]
+        
         scenario = Scenario(
             scenario_id=scenario_id,
             scenario_type="workflow_execution",
             name=f"Workflow Execution: {workflow.name}",
             description=f"Auto-created for workflow {workflow.workflow_id}",
             state="running",
-            config=json.dumps({
-                "workflow_id": workflow.workflow_id,
-                "input_params": input_params,
-                "is_workflow_execution": True,
-            }, ensure_ascii=False),
+            config=json.dumps(scenario_config, ensure_ascii=False),
             context=json.dumps({"trace_id": scenario_id}, ensure_ascii=False),
             created_by=created_by,
             created_at=now,
