@@ -48,11 +48,15 @@ async def health(request: web.Request) -> web.Response:
 
 
 async def list_servers(request: web.Request) -> web.Response:
-    """列出所有执行服务器"""
+    """列出所有执行服务器（租户隔离）"""
     ws_server = request.app["ws_server"]
+    tenant_id = request.get("tenant_id")  # 由 auth_middleware 注入
     try:
         repo = ExecutionServerRepository()
-        servers = await run_in_db_thread(repo.list_all)
+        if tenant_id:
+            servers = await run_in_db_thread(repo.find_all_by_tenant, tenant_id)
+        else:
+            servers = await run_in_db_thread(repo.list_all)
         result = [_server_to_dict(s, ws_server) for s in servers]
         return web.json_response({
             "success": True,
@@ -65,14 +69,21 @@ async def list_servers(request: web.Request) -> web.Response:
 
 
 async def get_server(request: web.Request) -> web.Response:
-    """获取单个服务器详情"""
+    """获取单个服务器详情（租户隔离）"""
     ws_server = request.app["ws_server"]
     server_id = request.match_info["server_id"]
+    tenant_id = request.get("tenant_id")
     try:
         repo = ExecutionServerRepository()
         server = await run_in_db_thread(repo.find_by_server_id, server_id)
 
         if not server:
+            return web.json_response(
+                {"success": False, "error": f"服务器 {server_id} 不存在"}, status=404
+            )
+
+        # 租户隔离：检查所有权
+        if tenant_id and server.tenant_id and server.tenant_id != tenant_id:
             return web.json_response(
                 {"success": False, "error": f"服务器 {server_id} 不存在"}, status=404
             )
@@ -87,10 +98,15 @@ async def get_server(request: web.Request) -> web.Response:
 
 
 async def cleanup_offline(request: web.Request) -> web.Response:
-    """清理所有离线服务器"""
+    """清理当前租户的离线服务器"""
+    tenant_id = request.get("tenant_id")
     try:
         repo = ExecutionServerRepository()
-        deleted_count = await run_in_db_thread(repo.delete_offline)
+        if tenant_id:
+            # 只清理当前租户的离线服务器
+            deleted_count = await run_in_db_thread(repo.delete_offline_by_tenant, tenant_id)
+        else:
+            deleted_count = await run_in_db_thread(repo.delete_offline)
 
         return web.json_response({
             "success": True,
@@ -103,9 +119,10 @@ async def cleanup_offline(request: web.Request) -> web.Response:
 
 
 async def delete_server(request: web.Request) -> web.Response:
-    """删除指定服务器 (仅离线可删)"""
+    """删除指定服务器 (仅离线可删，租户隔离)"""
     ws_server = request.app["ws_server"]
     server_id = request.match_info["server_id"]
+    tenant_id = request.get("tenant_id")
     try:
         # 守门：在线服务器不可删 (删后镜像与活连接分叉)
         if server_id in ws_server.connections:
@@ -115,6 +132,14 @@ async def delete_server(request: web.Request) -> web.Response:
             )
 
         repo = ExecutionServerRepository()
+        server = await run_in_db_thread(repo.find_by_server_id, server_id)
+
+        # 租户隔离：检查所有权
+        if tenant_id and server and server.tenant_id and server.tenant_id != tenant_id:
+            return web.json_response(
+                {"success": False, "error": f"服务器 {server_id} 不存在"}, status=404
+            )
+
         success = await run_in_db_thread(repo.delete, server_id)
 
         if success:
@@ -128,12 +153,13 @@ async def delete_server(request: web.Request) -> web.Response:
 
 
 async def dispatch_task(request: web.Request) -> web.Response:
-    """分发任务到执行服务器
+    """分发任务到执行服务器（租户隔离）
 
     写入一条 dispatch 消息行 (acked=0)。CentralDispatcher 在下次轮询时
     (每 0.5s 检查未 ack 行) 自动拾取并通过 WS 转发 TASK 帧。
     content JSON 必须包含 server_id (用于路由匹配) 以及 goal/context/task_id。
     """
+    tenant_id = request.get("tenant_id")
     try:
         payload = await request.json()
     except Exception:
@@ -152,6 +178,15 @@ async def dispatch_task(request: web.Request) -> web.Response:
         return web.json_response(
             {"success": False, "error": "task_id 和 server_id 为必填"}, status=400
         )
+
+    # 租户隔离：校验目标 server 属于当前租户
+    if tenant_id:
+        server_repo = ExecutionServerRepository()
+        server = await run_in_db_thread(server_repo.find_by_server_id, server_id)
+        if server and server.tenant_id and server.tenant_id != tenant_id:
+            return web.json_response(
+                {"success": False, "error": f"服务器 {server_id} 不存在或无权访问"}, status=404
+            )
 
     try:
         content = json.dumps({
@@ -172,6 +207,7 @@ async def dispatch_task(request: web.Request) -> web.Response:
             content=content,
             acked=0,
             timestamp=datetime.now(),
+            tenant_id=tenant_id,  # 租户隔离
         )
         repo = MessageRepository()
         message_id = await run_in_db_thread(repo.create, msg)

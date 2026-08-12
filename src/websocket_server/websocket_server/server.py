@@ -70,6 +70,7 @@ class ConnectedServer:
     server_id: str
     connected_at: datetime
     last_heartbeat: datetime
+    tenant_id: str = None  # 租户 ID（来自 API Key）
 
 
 class WebSocketServer:
@@ -85,8 +86,8 @@ class WebSocketServer:
         self.ssl_key = ssl_key
         # server_id -> ConnectedServer
         self.connections: Dict[str, ConnectedServer] = {}
-        # /subscribe endpoint subscribers
-        self.subscribers: set[web.WebSocketResponse] = set()
+        # /subscribe endpoint subscribers: ws -> tenant_id
+        self.subscribers: Dict[web.WebSocketResponse, str] = {}
         # 广播 fan-out 队列 + 慢订阅者连续失败计数（队列在 run() 中于 event loop 上创建）
         self._broadcast_queue: Optional[asyncio.Queue] = None
         self._broadcast_fail: Dict[web.WebSocketResponse, int] = {}
@@ -112,12 +113,16 @@ class WebSocketServer:
             loop = self._loop
             if not loop or loop.is_closed():
                 return
+            # 提取 tenant_id（如果存在）
+            event_data = event.get("data", {})
+            tenant_id = event_data.get("tenant_id") if isinstance(event_data, dict) else None
             asyncio.run_coroutine_threadsafe(
                 self._broadcast_event(event["event_type"], {
                     "trace_id": event.get("trace_id"),
                     "data": event.get("data"),
                     "metadata": event.get("metadata"),
                     "timestamp": event.get("timestamp"),
+                    "tenant_id": tenant_id,  # 租户隔离
                 }),
                 loop,
             )
@@ -237,21 +242,29 @@ class WebSocketServer:
 
     def _make_app(self) -> web.Application:
         """Build the aiohttp Application: WS routes + REST routes."""
-        app = web.Application()
+        from auth.middleware import auth_middleware
+        app = web.Application(middlewares=[auth_middleware])
         app.router.add_get("/", self.ws_handler)
         app.router.add_get("/subscribe", self.subscribe_handler)
         register_routes(app, self)
         return app
 
     async def subscribe_handler(self, request: web.Request) -> web.StreamResponse:
-        """Backend event subscription endpoint — receives task_result broadcasts."""
+        """Backend event subscription endpoint — receives task_result broadcasts (tenant-isolated)."""
+        from auth.ws_auth import authenticate_ws_connection
+
+        # WebSocket 鉴权
+        tenant_id = await authenticate_ws_connection(request)
+        if not tenant_id:
+            return web.Response(status=401, text="Unauthorized: Invalid or missing API key")
+
         ws = web.WebSocketResponse()
         if not ws.can_prepare(request).ok:
             return web.Response(text="WebSocket upgrade required", status=400)
 
         await ws.prepare(request)
-        self.subscribers.add(ws)
-        logger.info(f"后端订阅者已连接: {request.remote} (总计: {len(self.subscribers)})")
+        self.subscribers[ws] = tenant_id
+        logger.info(f"后端订阅者已连接: {request.remote}, tenant={tenant_id} (总计: {len(self.subscribers)})")
 
         try:
             async for msg in ws:
@@ -260,7 +273,7 @@ class WebSocketServer:
                 elif msg.type == WSMsgType.ERROR:
                     logger.error(f"订阅者 WS 错误: {ws.exception()}")
         finally:
-            self.subscribers.discard(ws)
+            del self.subscribers[ws]
             logger.info(f"后端订阅者已断开 (剩余: {len(self.subscribers)})")
 
         return ws
@@ -268,21 +281,30 @@ class WebSocketServer:
     # ── WS handler (GET /) ────────────────────────────────────────────────
 
     async def ws_handler(self, request: web.Request) -> web.StreamResponse:
-        """WebSocket entry point: upgrade WS, reject plain HTTP with info."""
+        """WebSocket entry point: upgrade WS, reject plain HTTP with info (tenant-isolated)."""
+        from auth.ws_auth import authenticate_ws_connection
+
+        # 对于非 WebSocket 请求，返回 REST API 信息
         ws = web.WebSocketResponse()
         if not ws.can_prepare(request).ok:
             return web.Response(
                 text="WebSocket Server.\n"
-                     "  WS   : ws://<host>:<port>/  (执行服务器 / human agent)\n"
+                     "  WS   : ws://<host>:<port>/?api_key=<token>  (执行服务器 / human agent)\n"
                      "  REST : GET /api/health | GET /api/servers | "
                      "POST /api/tasks/dispatch | DELETE /api/servers/{id}\n",
                 status=200,
                 content_type="text/plain",
             )
+
+        # WebSocket 鉴权
+        tenant_id = await authenticate_ws_connection(request)
+        if not tenant_id:
+            return web.Response(status=401, text="Unauthorized: Invalid or missing API key")
+
         await ws.prepare(request)
 
         server_id = None
-        logger.info(f"新连接来自: {request.remote}")
+        logger.info(f"新连接来自: {request.remote}, tenant={tenant_id}")
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
@@ -291,7 +313,7 @@ class WebSocketServer:
                         frame_type = frame["type"]
 
                         if frame_type == TYPE_REGISTER:
-                            server_id = await self._handle_register(ws, frame)
+                            server_id = await self._handle_register(ws, frame, tenant_id)
                         elif frame_type == TYPE_STATUS:
                             await self._handle_heartbeat(server_id, frame)
                         elif frame_type == TYPE_TASK_RESULT:
@@ -331,7 +353,7 @@ class WebSocketServer:
     # ── WS message handlers ───────────────────────────────────────────────
 
     async def _handle_register(self, ws: web.WebSocketResponse,
-                               frame: dict) -> Optional[str]:
+                               frame: dict, tenant_id: str = None) -> Optional[str]:
         """Handle register request from exec-server or human agent."""
         payload = frame.get("payload", {})
         server_id = payload.get("server_id")
@@ -355,6 +377,7 @@ class WebSocketServer:
                 server_id=server_id,
                 connected_at=now,
                 last_heartbeat=now,
+                tenant_id=tenant_id,
             )
             self.connections[server_id] = conn
 
@@ -366,10 +389,11 @@ class WebSocketServer:
             env_info=payload.get("env_info") or {},
             connected=True,
             source=payload.get("source") or "execution_server",
+            tenant_id=tenant_id,
         ))
 
         await ws.send_str(ack_frame(ok=True))
-        logger.info(f"服务器注册成功: {server_id} (quota={payload.get('total_quota', 0)})")
+        logger.info(f"服务器注册成功: {server_id} (quota={payload.get('total_quota', 0)}, tenant={tenant_id})")
 
         # Drain tasks parked while this server was offline
         self._drain_deferred(server_id)
@@ -404,13 +428,20 @@ class WebSocketServer:
         p = frame.get("payload", {})
         event = p.get("event")
         tid = frame.get("task_id")
+        # 获取连接的 tenant_id
+        tenant_id = None
+        if server_id and server_id in self.connections:
+            tenant_id = self.connections[server_id].tenant_id
+
         if event == EVENT_AGENT_CREATED:
             event_bus.emit("task.execution_agent_created", {
                 "task_id": tid, "role": p.get("role"), "server_id": server_id,
+                "tenant_id": tenant_id,
             })
         elif event == EVENT_TASK_STARTED:
             event_bus.emit("task.execution_started", {
                 "task_id": tid, "server_id": server_id,
+                "tenant_id": tenant_id,
             })
         else:
             logger.debug(f"task_event {event} for {tid}")
@@ -468,19 +499,28 @@ class WebSocketServer:
     async def _broadcast_worker(self):
         """Single-consumer fan-out: serializes per-subscriber sends (aiohttp
         WebSocketResponse is not safe to call concurrently) and bounds each send
-        with a timeout so a slow subscriber can't stall the worker."""
+        with a timeout so a slow subscriber can't stall the worker.
+
+        Tenant-isolated: only sends events to subscribers of the same tenant.
+        """
         q = self._broadcast_queue
         while True:
             event_type, payload = await q.get()
             try:
                 if not self.subscribers:
                     continue
+                # 获取事件的 tenant_id（如果存在）
+                event_tenant = payload.get("tenant_id") if isinstance(payload, dict) else None
                 frame = make_frame(TYPE_EVENT, {
                     "event_type": event_type,
                     "payload": payload,
                 })
                 dead = []
-                for ws in list(self.subscribers):
+                for ws, subscriber_tenant in list(self.subscribers.items()):
+                    # 租户隔离：只推送给同租户的订阅者
+                    # 如果事件没有 tenant_id，则推送给所有订阅者（向后兼容）
+                    if event_tenant and subscriber_tenant != event_tenant:
+                        continue
                     try:
                         await asyncio.wait_for(
                             ws.send_str(frame), timeout=_BROADCAST_SEND_TIMEOUT
@@ -496,7 +536,8 @@ class WebSocketServer:
                         logger.warning(f"广播失败: {e}")
                         dead.append(ws)
                 for ws in dead:
-                    self.subscribers.discard(ws)
+                    if ws in self.subscribers:
+                        del self.subscribers[ws]
                     self._broadcast_fail.pop(ws, None)
                     try:
                         await ws.close()

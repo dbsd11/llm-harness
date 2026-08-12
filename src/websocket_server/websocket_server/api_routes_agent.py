@@ -34,15 +34,18 @@ def _agent_to_dict(a) -> dict:
 
 
 async def list_agents(request: web.Request) -> web.Response:
-    """List agents with optional filters."""
+    """List agents with optional filters (tenant-isolated)."""
     agent_type = request.query.get("type")
     status = request.query.get("status")
     limit = int(request.query.get("limit", "200"))
+    tenant_id = request.get("tenant_id")
 
     try:
         repo = AgentRepository()
         if agent_type:
-            agents = await run_in_db_thread(repo.find_by_type, agent_type)
+            agents = await run_in_db_thread(lambda: repo.find_by_type(agent_type, tenant_id=tenant_id))
+        elif tenant_id:
+            agents = await run_in_db_thread(lambda: repo.find_all_by_tenant(tenant_id, limit=limit))
         else:
             agents = await run_in_db_thread(lambda: repo.find_all(limit=limit))
 
@@ -60,13 +63,18 @@ async def list_agents(request: web.Request) -> web.Response:
 
 
 async def get_agent(request: web.Request) -> web.Response:
-    """Get a single agent by ID."""
+    """Get a single agent by ID (tenant-isolated)."""
     agent_id = request.match_info["agent_id"]
+    tenant_id = request.get("tenant_id")
     try:
         repo = AgentRepository()
         agent = await run_in_db_thread(repo.find_by_agent_id, agent_id)
         if not agent:
             return web.json_response({"success": False, "error": "Agent not found"}, status=404)
+
+        if tenant_id and agent.tenant_id and agent.tenant_id != tenant_id:
+            return web.json_response({"success": False, "error": "Agent not found"}, status=404)
+
         return web.json_response({"success": True, "agent": _agent_to_dict(agent)})
     except Exception as e:
         logger.error(f"Failed to get agent: {e}")

@@ -44,17 +44,20 @@ def _task_to_dict(t) -> dict:
 
 
 async def list_tasks(request: web.Request) -> web.Response:
-    """List tasks with optional filters."""
+    """List tasks with optional filters (tenant-isolated)."""
     scenario_id = request.query.get("scenario_id")
     state = request.query.get("state")
     limit = int(request.query.get("limit", "100"))
+    tenant_id = request.get("tenant_id")
 
     try:
         repo = TaskRepository()
         if scenario_id:
-            tasks = await run_in_db_thread(repo.find_by_scenario_id, scenario_id)
+            tasks = await run_in_db_thread(lambda: repo.find_by_scenario_id(scenario_id, tenant_id=tenant_id))
         elif state:
-            tasks = await run_in_db_thread(repo.find_by_state, state)
+            tasks = await run_in_db_thread(lambda: repo.find_by_state(state, tenant_id=tenant_id))
+        elif tenant_id:
+            tasks = await run_in_db_thread(lambda: repo.find_all_by_tenant(tenant_id, limit=limit))
         else:
             tasks = await run_in_db_thread(lambda: repo.find_all(limit=limit))
 
@@ -69,13 +72,19 @@ async def list_tasks(request: web.Request) -> web.Response:
 
 
 async def get_task(request: web.Request) -> web.Response:
-    """Get a single task by ID."""
+    """Get a single task by ID (tenant-isolated)."""
     task_id = request.match_info["task_id"]
+    tenant_id = request.get("tenant_id")
     try:
         repo = TaskRepository()
         task = await run_in_db_thread(repo.find_by_task_id, task_id)
         if not task:
             return web.json_response({"success": False, "error": "Task not found"}, status=404)
+
+        # 租户隔离：检查所有权
+        if tenant_id and task.tenant_id and task.tenant_id != tenant_id:
+            return web.json_response({"success": False, "error": "Task not found"}, status=404)
+
         return web.json_response({"success": True, "task": _task_to_dict(task)})
     except Exception as e:
         logger.error(f"Failed to get task: {e}")
@@ -83,14 +92,20 @@ async def get_task(request: web.Request) -> web.Response:
 
 
 async def cancel_task(request: web.Request) -> web.Response:
-    """Cancel/delete a task (only non-terminal)."""
+    """Cancel/delete a task (only non-terminal, tenant-isolated)."""
     task_id = request.match_info["task_id"]
+    tenant_id = request.get("tenant_id")
     try:
         from core.state_machine import TASK_TERMINAL_STATES
         repo = TaskRepository()
         task = await run_in_db_thread(repo.find_by_task_id, task_id)
         if not task:
             return web.json_response({"success": False, "error": "Task not found"}, status=404)
+
+        # 租户隔离：检查所有权
+        if tenant_id and task.tenant_id and task.tenant_id != tenant_id:
+            return web.json_response({"success": False, "error": "Task not found"}, status=404)
+
         if task.state in TASK_TERMINAL_STATES:
             return web.json_response({
                 "success": False,
@@ -104,8 +119,9 @@ async def cancel_task(request: web.Request) -> web.Response:
 
 
 async def accept_task(request: web.Request) -> web.Response:
-    """Human acceptance review for a gated task."""
+    """Human acceptance review for a gated task (tenant-isolated)."""
     task_id = request.match_info["task_id"]
+    tenant_id = request.get("tenant_id")
     try:
         payload = await request.json()
     except Exception:
@@ -113,6 +129,13 @@ async def accept_task(request: web.Request) -> web.Response:
 
     passed = payload.get("passed", True)
     feedback = payload.get("feedback", "")
+
+    # 租户隔离：检查所有权
+    if tenant_id:
+        repo = TaskRepository()
+        task = await run_in_db_thread(repo.find_by_task_id, task_id)
+        if task and task.tenant_id and task.tenant_id != tenant_id:
+            return web.json_response({"success": False, "error": "Task not found"}, status=404)
 
     ok = await run_in_db_thread(scenario_manager.review_task, task_id, passed, feedback)
     if not ok:
@@ -122,6 +145,7 @@ async def accept_task(request: web.Request) -> web.Response:
     if ws_server:
         await ws_server._broadcast_event("task_reviewed", {
             "task_id": task_id, "passed": passed, "feedback": feedback,
+            "tenant_id": tenant_id,
         })
 
     return web.json_response({"success": True, "message": f"Task {task_id} reviewed"})

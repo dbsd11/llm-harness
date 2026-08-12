@@ -23,6 +23,7 @@ class WorkflowTaskTemplate(BaseModel):
         "step_order": int,
         "created_at": datetime,
         "updated_at": datetime,
+        "tenant_id": str,  # 租户 ID（来自 API Key）
     }
     __default_order__ = "step_order ASC"
 

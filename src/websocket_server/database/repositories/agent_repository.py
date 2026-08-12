@@ -39,9 +39,12 @@ class AgentRepository(BaseRepository[Agent]):
         results = self.find_by_criteria({"agent_id": agent_id})
         return results[0] if results else None
 
-    def find_by_type(self, agent_type: str) -> List[Agent]:
-        """Find agents by type"""
-        return self.find_by_criteria({"agent_type": agent_type})
+    def find_by_type(self, agent_type: str, tenant_id: str = None) -> List[Agent]:
+        """Find agents by type (with optional tenant isolation)"""
+        criteria = {"agent_type": agent_type}
+        if tenant_id:
+            return self._tenant_query(criteria, tenant_id)
+        return self.find_by_criteria(criteria)
 
     def find_by_status(self, status: str) -> List[Agent]:
         """Find agents by status"""

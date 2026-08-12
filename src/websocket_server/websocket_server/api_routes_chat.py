@@ -108,10 +108,8 @@ async def chat(request: web.Request) -> web.Response:
 
 
 async def chat_save(request: web.Request) -> web.Response:
-    """Persist a scene-spec draft to database.
-
-    Request: { "session_id": "...", "scene_spec": {...}, "scene_id": "optional-update-id" }
-    """
+    """Persist a scene-spec draft to database (tenant-isolated)."""
+    tenant_id = request.get("tenant_id")
     try:
         payload = await request.json()
     except Exception:
@@ -129,12 +127,19 @@ async def chat_save(request: web.Request) -> web.Response:
         if error:
             return web.json_response({"success": False, "error": error}, status=400)
 
+        # 设置 tenant_id
+        if tenant_id:
+            from database.repositories.scenario_repository import ScenarioRepository
+            repo = ScenarioRepository()
+            await run_in_db_thread(repo.update_tenant_id, saved_id, tenant_id)
+
         # Broadcast event
         ws_server = request.app.get("ws_server")
         if ws_server:
             await ws_server._broadcast_event("scenario_created" if not scene_id else "scenario_updated", {
                 "scenario_id": saved_id,
                 "name": spec.get("name", ""),
+                "tenant_id": tenant_id,
             })
 
         # Save confirmation message
@@ -172,14 +177,23 @@ async def chat_preview(request: web.Request) -> web.Response:
 
 
 async def chat_load_scene(request: web.Request) -> web.Response:
-    """Load an existing scenario's spec for editing."""
+    """Load an existing scenario's spec for editing (tenant-isolated)."""
     scene_id = request.query.get("scene_id")
+    tenant_id = request.get("tenant_id")
     if not scene_id:
         return web.json_response({"success": False, "error": "scene_id is required"}, status=400)
 
     spec = await run_in_db_thread(load_scenario_spec, scene_id)
     if not spec:
         return web.json_response({"success": False, "error": "Scene not found"}, status=404)
+
+    # 租户隔离：检查所有权
+    if tenant_id:
+        from database.repositories.scenario_repository import ScenarioRepository
+        repo = ScenarioRepository()
+        scenario = await run_in_db_thread(repo.find_by_scenario_id, scene_id)
+        if scenario and scenario.tenant_id and scenario.tenant_id != tenant_id:
+            return web.json_response({"success": False, "error": "Scene not found"}, status=404)
 
     return web.json_response({"success": True, "scene_spec": spec})
 
@@ -191,7 +205,8 @@ async def chat_scene_index(request: web.Request) -> web.Response:
 
 
 async def chat_workflow_save(request: web.Request) -> web.Response:
-    """Persist a workflow-spec draft to database."""
+    """Persist a workflow-spec draft to database (tenant-isolated)."""
+    tenant_id = request.get("tenant_id")
     try:
         payload = await request.json()
     except Exception:
@@ -209,12 +224,22 @@ async def chat_workflow_save(request: web.Request) -> web.Response:
         if error:
             return web.json_response({"success": False, "error": error}, status=400)
 
+        # 设置 tenant_id
+        if tenant_id:
+            from database.repositories.workflow_repository import WorkflowRepository
+            repo = WorkflowRepository()
+            wf = await run_in_db_thread(repo.find_by_workflow_id, saved_id)
+            if wf:
+                wf.tenant_id = tenant_id
+                await run_in_db_thread(repo.update, wf)
+
         ws_server = request.app.get("ws_server")
         if ws_server:
             evt_type = "workflow_updated" if workflow_id else "workflow_published"
             await ws_server._broadcast_event(evt_type, {
                 "workflow_id": saved_id,
                 "name": spec.get("name", ""),
+                "tenant_id": tenant_id,
             })
 
         msg_repo = AssistantMessageRepository()
@@ -241,14 +266,23 @@ async def chat_workflow_index(request: web.Request) -> web.Response:
 
 
 async def chat_load_workflow(request: web.Request) -> web.Response:
-    """Load an existing workflow's spec for editing."""
+    """Load an existing workflow's spec for editing (tenant-isolated)."""
     workflow_id = request.query.get("workflow_id")
+    tenant_id = request.get("tenant_id")
     if not workflow_id:
         return web.json_response({"success": False, "error": "workflow_id is required"}, status=400)
 
     spec = await run_in_db_thread(load_workflow_spec, workflow_id)
     if not spec:
         return web.json_response({"success": False, "error": "Workflow not found"}, status=404)
+
+    # 租户隔离：检查所有权
+    if tenant_id:
+        from database.repositories.workflow_repository import WorkflowRepository
+        repo = WorkflowRepository()
+        wf = await run_in_db_thread(repo.find_by_workflow_id, workflow_id)
+        if wf and wf.tenant_id and wf.tenant_id != tenant_id:
+            return web.json_response({"success": False, "error": "Workflow not found"}, status=404)
 
     return web.json_response({"success": True, "workflow_spec": spec})
 

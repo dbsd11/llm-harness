@@ -305,3 +305,111 @@ class BaseRepository(Generic[T]):
                 result.append(self.model_class.from_dict(data))
             
             return result
+
+    def _tenant_query(self, criteria: Dict[str, Any], tenant_id: str,
+                      limit: int = None) -> List[T]:
+        """租户隔离的通用查询构建器
+
+        strict 模式：WHERE criteria AND tenant_id = ?
+        兼容模式：WHERE criteria AND (tenant_id = ? OR tenant_id IS NULL)
+        """
+        import os
+        strict = os.getenv("WS_TENANT_STRICT", "false").lower() == "true"
+
+        if strict:
+            criteria["tenant_id"] = tenant_id
+            return self.find_by_criteria(criteria, limit=limit)
+
+        where_parts = []
+        values = []
+        for field, value in criteria.items():
+            where_parts.append(f"{field} = {self.placeholder}")
+            values.append(value)
+        where_parts.append(f"(tenant_id = {self.placeholder} OR tenant_id IS NULL)")
+        values.append(tenant_id)
+
+        where_clause = " AND ".join(where_parts)
+        sql = f"SELECT * FROM {self.table_name} WHERE {where_clause}"
+
+        if self.model_class.__default_order__:
+            sql += f" ORDER BY {self.model_class.__default_order__}"
+        if limit is not None:
+            sql += f" LIMIT {limit}"
+
+        connection_manager = get_connection_manager()
+        with connection_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, values)
+            rows = cursor.fetchall()
+            result = []
+            for row in rows:
+                data = {key: row[key] for key in row.keys()}
+                result.append(self.model_class.from_dict(data))
+            return result
+
+    # ── Tenant-aware methods for multi-tenant isolation ──────────────────────
+
+    def find_all_by_tenant(self, tenant_id: str, order_by: str = None, 
+                           limit: int = None, offset: int = None,
+                           strict: bool = False) -> List[T]:
+        """租户隔离的全量查询，委托给 _tenant_query 统一处理"""
+        return self._tenant_query({}, tenant_id, limit=limit)
+
+    def find_by_id_and_tenant(self, id: Any, tenant_id: str, strict: bool = False) -> Optional[T]:
+        """租户隔离的单条查询
+
+        Args:
+            id: 主键值
+            tenant_id: 租户 ID
+            strict: 严格模式
+        """
+        if strict:
+            criteria = {self.primary_key: id, "tenant_id": tenant_id}
+        else:
+            # 兼容模式
+            where_clause = f"{self.primary_key} = {self.placeholder} AND (tenant_id = {self.placeholder} OR tenant_id IS NULL)"
+            sql = f"SELECT * FROM {self.table_name} WHERE {where_clause}"
+            
+            connection_manager = get_connection_manager()
+            with connection_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql, (id, tenant_id))
+                row = cursor.fetchone()
+                
+                if row is None:
+                    return None
+                
+                data = {key: row[key] for key in row.keys()}
+                return self.model_class.from_dict(data)
+        
+        results = self.find_by_criteria(criteria)
+        return results[0] if results else None
+
+    def count_by_tenant(self, tenant_id: str, strict: bool = False) -> int:
+        """租户隔离的记录计数"""
+        if strict:
+            return self.count({"tenant_id": tenant_id})
+        else:
+            sql = f"SELECT COUNT(*) as count FROM {self.table_name} WHERE (tenant_id = {self.placeholder} OR tenant_id IS NULL)"
+            connection_manager = get_connection_manager()
+            with connection_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql, (tenant_id,))
+                row = cursor.fetchone()
+                return row['count'] if row else 0
+
+    def delete_by_tenant(self, id: Any, tenant_id: str, strict: bool = False) -> bool:
+        """租户隔离的删除操作（只删除属于当前租户的记录）"""
+        if strict:
+            sql = f"DELETE FROM {self.table_name} WHERE {self.primary_key} = {self.placeholder} AND tenant_id = {self.placeholder}"
+            values = (id, tenant_id)
+        else:
+            sql = f"DELETE FROM {self.table_name} WHERE {self.primary_key} = {self.placeholder} AND (tenant_id = {self.placeholder} OR tenant_id IS NULL)"
+            values = (id, tenant_id)
+        
+        connection_manager = get_connection_manager()
+        with connection_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, values)
+            conn.commit()
+            return cursor.rowcount > 0

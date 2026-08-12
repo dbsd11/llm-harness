@@ -22,6 +22,7 @@ class Workflow(BaseModel):
         "created_by": str,
         "created_at": datetime,
         "updated_at": datetime,
+        "tenant_id": str,  # 租户 ID（来自 API Key）
     }
     __default_order__ = "created_at DESC"
 

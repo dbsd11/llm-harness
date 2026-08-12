@@ -70,13 +70,19 @@ class TaskRepository(BaseRepository[Task]):
             return []
         return self.find_by_criteria({"topic_id": topic_id})
 
-    def find_by_state(self, state: str) -> List[Task]:
-        """Find tasks by state"""
-        return self.find_by_criteria({"state": state})
+    def find_by_state(self, state: str, tenant_id: str = None) -> List[Task]:
+        """Find tasks by state (with optional tenant isolation)"""
+        criteria = {"state": state}
+        if tenant_id:
+            return self._tenant_query(criteria, tenant_id)
+        return self.find_by_criteria(criteria)
 
-    def find_by_scenario_id(self, scenario_id: str) -> List[Task]:
-        """Find tasks by scenario_id"""
-        return self.find_by_criteria({"scenario_id": scenario_id})
+    def find_by_scenario_id(self, scenario_id: str, tenant_id: str = None) -> List[Task]:
+        """Find tasks by scenario_id (with optional tenant isolation)"""
+        criteria = {"scenario_id": scenario_id}
+        if tenant_id:
+            return self._tenant_query(criteria, tenant_id)
+        return self.find_by_criteria(criteria)
 
     def find_by_parent_task_id(self, parent_task_id: str) -> List[Task]:
         """Find all subtasks of a parent task"""

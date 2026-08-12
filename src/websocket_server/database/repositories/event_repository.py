@@ -38,26 +38,40 @@ class EventRepository(BaseRepository[Event]):
             pass
 
     def create_event(self, event_type: str, data: str,
-                     trace_id: str = None, metadata: str = None) -> int:
-        """Create a new event with optional trace context"""
+                     trace_id: str = None, metadata: str = None,
+                     tenant_id: str = None) -> int:
+        """Create a new event with optional trace context and tenant isolation"""
         event = Event(
             event_type=event_type,
             data=data,
             trace_id=trace_id,
             metadata=metadata,
-            timestamp=datetime.now()
+            timestamp=datetime.now(),
+            tenant_id=tenant_id,
         )
         return self.create(event)
 
-    def find_by_trace_id(self, trace_id: str, limit: int = 100) -> List[Event]:
+    def find_by_trace_id(self, trace_id: str, limit: int = 100,
+                         tenant_id: str = None) -> List[Event]:
         """Find all events in a trace (跨事件追踪)"""
         if not trace_id:
             return []
-        return self.find_by_criteria({"trace_id": trace_id}, limit=limit)
+        criteria = {"trace_id": trace_id}
+        if tenant_id:
+            return self._tenant_query(criteria, tenant_id, limit=limit)
+        return self.find_by_criteria(criteria, limit=limit)
 
-    def find_by_event_type(self, event_type: str, limit: int = 100) -> List[Event]:
+    def find_by_event_type(self, event_type: str, limit: int = 100,
+                           tenant_id: str = None) -> List[Event]:
         """Find events by event type"""
-        return self.find_by_criteria({"event_type": event_type}, limit=limit)
+        criteria = {"event_type": event_type}
+        if tenant_id:
+            return self._tenant_query(criteria, tenant_id, limit=limit)
+        return self.find_by_criteria(criteria, limit=limit)
+
+    # Aliases used by api_routes_event.py
+    find_by_type = find_by_event_type
+    find_by_trace = find_by_trace_id
 
     def find_by_event_type_prefix(self, prefix: str, limit: int = 100) -> List[Event]:
         """Find events by event type prefix (e.g., 'task.*')"""

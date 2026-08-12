@@ -16,7 +16,8 @@ class User(BaseModel):
         "is_active": bool,
         "organization_id": int,  # 关联的单位ID
         "created_at": datetime,
-        "updated_at": datetime
+        "updated_at": datetime,
+        "tenant_id": str,  # 租户 ID（来自 API Key）
     }
     __default_order__ = "id DESC"
     

@@ -13,7 +13,10 @@ class WorkflowRepository(BaseRepository[Workflow]):
         results = self.find_by_criteria({"workflow_id": workflow_id})
         return results[0] if results else None
 
-    def find_by_state(self, state: str, limit: int = 100) -> List[Workflow]:
+    def find_by_state(self, state: str, limit: int = 100,
+                      tenant_id: str = None) -> List[Workflow]:
+        if tenant_id:
+            return self._tenant_query({"state": state}, tenant_id, limit=limit)
         return self.find_by_criteria({"state": state}, limit=limit)
 
     def find_by_source_scenario_id(self, scenario_id: str) -> List[Workflow]:

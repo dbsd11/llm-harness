@@ -14,17 +14,20 @@ def _iso(v) -> str:
 
 
 async def list_events(request: web.Request) -> web.Response:
-    """List events with optional type/trace_id filters."""
+    """List events with optional type/trace_id filters (tenant-isolated)."""
     event_type = request.query.get("event_type")
     trace_id = request.query.get("trace_id")
     limit = int(request.query.get("limit", "100"))
+    tenant_id = request.get("tenant_id")
 
     try:
         repo = EventRepository()
         if event_type:
-            events = await run_in_db_thread(lambda: repo.find_by_type(event_type, limit=limit))
+            events = await run_in_db_thread(lambda: repo.find_by_type(event_type, limit=limit, tenant_id=tenant_id))
         elif trace_id:
-            events = await run_in_db_thread(lambda: repo.find_by_trace(trace_id, limit=limit))
+            events = await run_in_db_thread(lambda: repo.find_by_trace(trace_id, limit=limit, tenant_id=tenant_id))
+        elif tenant_id:
+            events = await run_in_db_thread(lambda: repo.find_all_by_tenant(tenant_id, limit=limit))
         else:
             events = await run_in_db_thread(lambda: repo.find_all(limit=limit))
 
@@ -51,7 +54,8 @@ async def list_events(request: web.Request) -> web.Response:
 
 
 async def create_event(request: web.Request) -> web.Response:
-    """Create an event (for external callers like the platform)."""
+    """Create an event (for external callers like the platform, tenant-isolated)."""
+    tenant_id = request.get("tenant_id")
     try:
         payload = await request.json()
     except Exception:
@@ -69,12 +73,15 @@ async def create_event(request: web.Request) -> web.Response:
         repo = EventRepository()
         data_str = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
         metadata_str = json.dumps(metadata, ensure_ascii=False) if isinstance(metadata, dict) else str(metadata)
-        event_id = await run_in_db_thread(repo.create_event, event_type, data_str, trace_id, metadata_str)
+        event_id = await run_in_db_thread(lambda: repo.create_event(event_type, data_str, trace_id, metadata_str, tenant_id=tenant_id))
 
         # Broadcast to subscribers
         ws_server = request.app.get("ws_server")
         if ws_server:
-            await ws_server._broadcast_event(event_type, data if isinstance(data, dict) else {"raw": str(data)})
+            await ws_server._broadcast_event(event_type, {
+                **(data if isinstance(data, dict) else {"raw": str(data)}),
+                "tenant_id": tenant_id,
+            })
 
         return web.json_response({"success": True, "event_id": event_id})
     except Exception as e:

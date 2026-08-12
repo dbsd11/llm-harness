@@ -23,6 +23,7 @@ class ExecutionServer(BaseModel):
         "last_heartbeat": datetime,
         "connected": bool,       # WS connection alive
         "updated_at": datetime,
+        "tenant_id": str,        # 租户 ID（来自 API Key）
     }
     __default_order__ = "server_id ASC"
 

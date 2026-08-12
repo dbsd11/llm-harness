@@ -14,6 +14,7 @@ class AssistantMessage(BaseModel):
         "timestamp": datetime,
         "session_id": str,
         "summary": str,       # nullable, only for role="summary"
+        "tenant_id": str,     # 租户 ID（来自 API Key）
     }
     __default_order__ = "timestamp ASC"
 

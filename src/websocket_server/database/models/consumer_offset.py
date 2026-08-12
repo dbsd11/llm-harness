@@ -12,6 +12,7 @@ class ConsumerOffset(BaseModel):
         "consumer_id": str,   # e.g. "execution_worker:{scenario_id}"
         "last_message_id": int,
         "updated_at": datetime,
+        "tenant_id": str,     # 租户 ID（来自 API Key）
     }
     __default_order__ = ""
 

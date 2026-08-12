@@ -39,7 +39,8 @@ def _scenario_to_dict(s) -> dict:
 
 
 async def create_scenario(request: web.Request) -> web.Response:
-    """Create a new scenario."""
+    """Create a new scenario (tenant-isolated)."""
+    tenant_id = request.get("tenant_id")
     try:
         payload = await request.json()
     except Exception:
@@ -64,12 +65,18 @@ async def create_scenario(request: web.Request) -> web.Response:
             scenario_manager.create_scenario,
             scenario_type, name, description, config, created_by,
         )
+
+        # 设置 tenant_id
+        if tenant_id:
+            repo = ScenarioRepository()
+            await run_in_db_thread(repo.update_tenant_id, scenario_id, tenant_id)
+
         # Broadcast event
         ws_server = request.app.get("ws_server")
         if ws_server:
             await ws_server._broadcast_event("scenario_created", {
                 "scenario_id": scenario_id, "scenario_type": scenario_type,
-                "name": name, "state": "initializing",
+                "name": name, "state": "initializing", "tenant_id": tenant_id,
             })
 
         scenario = await run_in_db_thread(ScenarioRepository().find_by_scenario_id, scenario_id)
@@ -83,14 +90,17 @@ async def create_scenario(request: web.Request) -> web.Response:
 
 
 async def list_scenarios(request: web.Request) -> web.Response:
-    """List all scenarios with optional state filter."""
+    """List all scenarios with optional state filter (tenant-isolated)."""
     state = request.query.get("state")
     limit = int(request.query.get("limit", "100"))
+    tenant_id = request.get("tenant_id")
 
     try:
         repo = ScenarioRepository()
         if state:
-            scenarios = await run_in_db_thread(lambda: repo.find_by_state(state, limit=limit))
+            scenarios = await run_in_db_thread(lambda: repo.find_by_state(state, limit=limit, tenant_id=tenant_id))
+        elif tenant_id:
+            scenarios = await run_in_db_thread(lambda: repo.find_all_by_tenant(tenant_id, limit=limit))
         else:
             scenarios = await run_in_db_thread(lambda: repo.find_all(limit=limit))
 
@@ -105,13 +115,19 @@ async def list_scenarios(request: web.Request) -> web.Response:
 
 
 async def get_scenario(request: web.Request) -> web.Response:
-    """Get a single scenario by ID."""
+    """Get a single scenario by ID (tenant-isolated)."""
     scenario_id = request.match_info["scenario_id"]
+    tenant_id = request.get("tenant_id")
     try:
         repo = ScenarioRepository()
         scenario = await run_in_db_thread(repo.find_by_scenario_id, scenario_id)
         if not scenario:
             return web.json_response({"success": False, "error": "Scenario not found"}, status=404)
+
+        # 租户隔离：检查所有权
+        if tenant_id and scenario.tenant_id and scenario.tenant_id != tenant_id:
+            return web.json_response({"success": False, "error": "Scenario not found"}, status=404)
+
         return web.json_response({"success": True, "scenario": _scenario_to_dict(scenario)})
     except Exception as e:
         logger.error(f"Failed to get scenario: {e}")
@@ -119,12 +135,17 @@ async def get_scenario(request: web.Request) -> web.Response:
 
 
 async def start_scenario(request: web.Request) -> web.Response:
-    """Start a scenario."""
+    """Start a scenario (tenant-isolated)."""
     scenario_id = request.match_info["scenario_id"]
+    tenant_id = request.get("tenant_id")
     try:
         repo = ScenarioRepository()
         scenario = await run_in_db_thread(repo.find_by_scenario_id, scenario_id)
         if not scenario:
+            return web.json_response({"success": False, "error": "Scenario not found"}, status=404)
+
+        # 租户隔离：检查所有权
+        if tenant_id and scenario.tenant_id and scenario.tenant_id != tenant_id:
             return web.json_response({"success": False, "error": "Scenario not found"}, status=404)
 
         if scenario.state != ScenarioState.INITIALIZING.value:
@@ -152,7 +173,7 @@ async def start_scenario(request: web.Request) -> web.Response:
         ws_server = request.app.get("ws_server")
         if ws_server:
             await ws_server._broadcast_event("scenario_started", {
-                "scenario_id": scenario_id,
+                "scenario_id": scenario_id, "tenant_id": tenant_id,
             })
 
         return web.json_response({"success": True, "message": f"Scenario {scenario_id} started"})
@@ -162,9 +183,17 @@ async def start_scenario(request: web.Request) -> web.Response:
 
 
 async def stop_scenario(request: web.Request) -> web.Response:
-    """Stop a scenario."""
+    """Stop a scenario (tenant-isolated)."""
     scenario_id = request.match_info["scenario_id"]
+    tenant_id = request.get("tenant_id")
     try:
+        # 租户隔离：先检查所有权
+        if tenant_id:
+            repo = ScenarioRepository()
+            scenario = await run_in_db_thread(repo.find_by_scenario_id, scenario_id)
+            if scenario and scenario.tenant_id and scenario.tenant_id != tenant_id:
+                return web.json_response({"success": False, "error": "Scenario not found"}, status=404)
+
         ok = await run_in_db_thread(scenario_manager.stop_scenario, scenario_id)
         if not ok:
             return web.json_response({"success": False, "error": "Scenario not found"}, status=404)
@@ -172,7 +201,7 @@ async def stop_scenario(request: web.Request) -> web.Response:
         ws_server = request.app.get("ws_server")
         if ws_server:
             await ws_server._broadcast_event("scenario_stopped", {
-                "scenario_id": scenario_id,
+                "scenario_id": scenario_id, "tenant_id": tenant_id,
             })
 
         return web.json_response({"success": True, "message": f"Scenario {scenario_id} stopped"})
@@ -182,12 +211,17 @@ async def stop_scenario(request: web.Request) -> web.Response:
 
 
 async def delete_scenario(request: web.Request) -> web.Response:
-    """Delete a scenario (must be stopped first)."""
+    """Delete a scenario (must be stopped first, tenant-isolated)."""
     scenario_id = request.match_info["scenario_id"]
+    tenant_id = request.get("tenant_id")
     try:
         repo = ScenarioRepository()
         scenario = await run_in_db_thread(repo.find_by_scenario_id, scenario_id)
         if not scenario:
+            return web.json_response({"success": False, "error": "Scenario not found"}, status=404)
+
+        # 租户隔离：检查所有权
+        if tenant_id and scenario.tenant_id and scenario.tenant_id != tenant_id:
             return web.json_response({"success": False, "error": "Scenario not found"}, status=404)
 
         # Only allow deletion of non-running scenarios
@@ -205,12 +239,17 @@ async def delete_scenario(request: web.Request) -> web.Response:
 
 
 async def get_scenario_messages(request: web.Request) -> web.Response:
-    """Get message history timeline for a scenario (dispatch/reply/events/reviews)."""
+    """Get message history timeline for a scenario (tenant-isolated)."""
     scenario_id = request.match_info["scenario_id"]
+    tenant_id = request.get("tenant_id")
     try:
         repo = ScenarioRepository()
         scenario = await run_in_db_thread(repo.find_by_scenario_id, scenario_id)
         if not scenario:
+            return web.json_response({"success": False, "error": "Scenario not found"}, status=404)
+
+        # 租户隔离：检查所有权
+        if tenant_id and scenario.tenant_id and scenario.tenant_id != tenant_id:
             return web.json_response({"success": False, "error": "Scenario not found"}, status=404)
 
         trace_id = ""

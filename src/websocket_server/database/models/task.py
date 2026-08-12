@@ -34,6 +34,7 @@ class Task(BaseModel):
         "updated_at": datetime,
         "started_at": datetime,
         "completed_at": datetime,
+        "tenant_id": str,  # 租户 ID（来自 API Key）
     }
     __default_order__ = "created_at DESC"
 

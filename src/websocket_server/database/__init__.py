@@ -65,6 +65,10 @@ def init_database():
         AssistantMessageRepository()._ensure_columns()
         logger.info("AssistantMessage table migration complete")
 
+        # Run tenant_id migration (add tenant_id column to all tables)
+        from .migration_tenant import migrate_add_tenant_id
+        migrate_add_tenant_id()
+
         _indexes = [
             "CREATE INDEX IF NOT EXISTS idx_messages_dispatch_acked ON messages(message_type, acked, id)",
             "CREATE INDEX IF NOT EXISTS idx_messages_task_id ON messages(task_id)",

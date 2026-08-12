@@ -2,6 +2,7 @@
 import os
 import sqlite3
 import logging
+import threading
 from contextlib import contextmanager
 from typing import Dict, Any, Optional
 import pymysql
@@ -20,6 +21,7 @@ class ConnectionManager:
     _instance = None
     _connections = {}
     _pools = {}
+    _sqlite_lock = threading.Lock()
     
     def __new__(cls):
         if cls._instance is None:
@@ -120,9 +122,9 @@ class ConnectionManager:
     
     @contextmanager
     def get_connection(self, db_name: str = 'default'):
-        """获取数据库连接"""
         conn = None
         is_pool_connection = False
+        is_sqlite = False
         
         try:
             # 检查是否有连接池
@@ -136,6 +138,8 @@ class ConnectionManager:
                     raise DatabaseConnectionError(f"数据库连接池已耗尽，请稍后再试。错误: {str(pool_error)}")
             elif db_name in self._connections:
                 conn = self._connections[db_name]
+                is_sqlite = True
+                self._sqlite_lock.acquire()
                 logger.debug(f"获取已有连接: {db_name}")
             else:
                 logger.error(f"未找到数据库连接: {db_name}")
@@ -173,6 +177,9 @@ class ConnectionManager:
                     logger.debug(f"连接已归还到连接池: {db_name}")
                 except Exception as close_error:
                     logger.error(f"归还连接到连接池失败: {str(close_error)}")
+            # 释放SQLite锁
+            if is_sqlite:
+                self._sqlite_lock.release()
     
     def close_all(self):
         """关闭所有连接"""

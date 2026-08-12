@@ -16,9 +16,12 @@ class ScenarioRepository(BaseRepository[Scenario]):
         results = self.find_by_criteria({"scenario_id": scenario_id})
         return results[0] if results else None
 
-    def find_by_state(self, state: str) -> List[Scenario]:
-        """Find scenarios by state"""
-        return self.find_by_criteria({"state": state})
+    def find_by_state(self, state: str, limit: int = None, tenant_id: str = None) -> List[Scenario]:
+        """Find scenarios by state with optional tenant filtering"""
+        criteria = {"state": state}
+        if tenant_id:
+            return self._tenant_query(criteria, tenant_id, limit=limit)
+        return self.find_by_criteria(criteria, limit=limit)
 
     def update_scenario_state(self, scenario_id: str, new_state: str) -> bool:
         """Update scenario state"""
@@ -48,5 +51,14 @@ class ScenarioRepository(BaseRepository[Scenario]):
             return False
         scenario.state = "failed"
         scenario.completed_at = datetime.now()
+        scenario.updated_at = datetime.now()
+        return self.update(scenario)
+
+    def update_tenant_id(self, scenario_id: str, tenant_id: str) -> bool:
+        """Update scenario tenant_id for multi-tenant isolation"""
+        scenario = self.find_by_scenario_id(scenario_id)
+        if not scenario:
+            return False
+        scenario.tenant_id = tenant_id
         scenario.updated_at = datetime.now()
         return self.update(scenario)

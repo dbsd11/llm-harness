@@ -47,16 +47,26 @@ async def publish_workflow(request: web.Request) -> web.Response:
     name = payload.get("name")
     description = payload.get("description")
     created_by = payload.get("created_by")
+    tenant_id = request.get("tenant_id")
 
     try:
         result = await run_in_db_thread(
             workflow_publisher.publish, scenario_id, name, description, created_by)
+
+        # 设置 tenant_id
+        if tenant_id:
+            repo = WorkflowRepository()
+            wf = await run_in_db_thread(repo.find_by_workflow_id, result["workflow_id"])
+            if wf:
+                wf.tenant_id = tenant_id
+                await run_in_db_thread(repo.update, wf)
 
         ws_server = request.app.get("ws_server")
         if ws_server:
             await ws_server._broadcast_event("workflow_published", {
                 "workflow_id": result["workflow_id"],
                 "name": result["name"],
+                "tenant_id": tenant_id,
             })
 
         return web.json_response({"success": True, "workflow": result})
@@ -70,11 +80,14 @@ async def publish_workflow(request: web.Request) -> web.Response:
 async def list_workflows(request: web.Request) -> web.Response:
     state = request.query.get("state")
     limit = int(request.query.get("limit", "100"))
+    tenant_id = request.get("tenant_id")
 
     try:
         repo = WorkflowRepository()
         if state:
-            workflows = await run_in_db_thread(lambda: repo.find_by_state(state, limit=limit))
+            workflows = await run_in_db_thread(lambda: repo.find_by_state(state, limit=limit, tenant_id=tenant_id))
+        elif tenant_id:
+            workflows = await run_in_db_thread(lambda: repo.find_all_by_tenant(tenant_id, limit=limit))
         else:
             workflows = await run_in_db_thread(lambda: repo.find_all(limit=limit))
 
@@ -90,10 +103,15 @@ async def list_workflows(request: web.Request) -> web.Response:
 
 async def get_workflow(request: web.Request) -> web.Response:
     workflow_id = request.match_info["workflow_id"]
+    tenant_id = request.get("tenant_id")
     try:
         repo = WorkflowRepository()
         wf = await run_in_db_thread(repo.find_by_workflow_id, workflow_id)
         if not wf:
+            return web.json_response({"success": False, "error": "Workflow not found"}, status=404)
+
+        # 租户隔离：检查所有权
+        if tenant_id and wf.tenant_id and wf.tenant_id != tenant_id:
             return web.json_response({"success": False, "error": "Workflow not found"}, status=404)
 
         template_repo = WorkflowTaskTemplateRepository()
@@ -124,6 +142,7 @@ async def get_workflow(request: web.Request) -> web.Response:
 
 async def update_workflow(request: web.Request) -> web.Response:
     workflow_id = request.match_info["workflow_id"]
+    tenant_id = request.get("tenant_id")
     try:
         payload = await request.json()
     except Exception:
@@ -133,6 +152,10 @@ async def update_workflow(request: web.Request) -> web.Response:
         repo = WorkflowRepository()
         wf = await run_in_db_thread(repo.find_by_workflow_id, workflow_id)
         if not wf:
+            return web.json_response({"success": False, "error": "Workflow not found"}, status=404)
+
+        # 租户隔离：检查所有权
+        if tenant_id and wf.tenant_id and wf.tenant_id != tenant_id:
             return web.json_response({"success": False, "error": "Workflow not found"}, status=404)
 
         if "name" in payload:
@@ -152,9 +175,16 @@ async def update_workflow(request: web.Request) -> web.Response:
 
 async def delete_workflow(request: web.Request) -> web.Response:
     workflow_id = request.match_info["workflow_id"]
+    tenant_id = request.get("tenant_id")
     try:
         repo = WorkflowRepository()
         template_repo = WorkflowTaskTemplateRepository()
+
+        # 租户隔离：检查所有权
+        if tenant_id:
+            wf = await run_in_db_thread(repo.find_by_workflow_id, workflow_id)
+            if wf and wf.tenant_id and wf.tenant_id != tenant_id:
+                return web.json_response({"success": False, "error": "Workflow not found"}, status=404)
 
         await run_in_db_thread(template_repo.delete_by_workflow_id, workflow_id)
         ok = await run_in_db_thread(repo.delete_by_workflow_id, workflow_id)
@@ -169,6 +199,7 @@ async def delete_workflow(request: web.Request) -> web.Response:
 
 async def execute_workflow(request: web.Request) -> web.Response:
     workflow_id = request.match_info["workflow_id"]
+    tenant_id = request.get("tenant_id")
     try:
         payload = await request.json()
     except Exception:
@@ -178,6 +209,13 @@ async def execute_workflow(request: web.Request) -> web.Response:
     created_by = payload.get("created_by")
 
     try:
+        # 租户隔离：检查所有权
+        if tenant_id:
+            repo = WorkflowRepository()
+            wf = await run_in_db_thread(repo.find_by_workflow_id, workflow_id)
+            if wf and wf.tenant_id and wf.tenant_id != tenant_id:
+                return web.json_response({"success": False, "error": "Workflow not found"}, status=404)
+
         result = await run_in_db_thread(
             workflow_executor.execute, workflow_id, input_params, created_by)
 
@@ -186,6 +224,7 @@ async def execute_workflow(request: web.Request) -> web.Response:
             await ws_server._broadcast_event("workflow_execution_started", {
                 "scenario_id": result["scenario_id"],
                 "workflow_id": workflow_id,
+                "tenant_id": tenant_id,
             })
 
         return web.json_response({"success": True, "execution": result})

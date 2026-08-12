@@ -18,7 +18,8 @@ class ExecutionServerRepository(BaseRepository[ExecutionServer]):
                total_quota: int = 0, running_count: int = 0,
                env_info: dict = None, connected: bool = False,
                last_heartbeat: datetime = None,
-               source: str = None) -> None:
+               source: str = None,
+               tenant_id: str = None) -> None:
         """Insert or replace a server row (keyed on server_id)."""
         env_json = json.dumps(env_info, ensure_ascii=False) if env_info else "{}"
         hb = last_heartbeat or datetime.now()
@@ -29,24 +30,24 @@ class ExecutionServerRepository(BaseRepository[ExecutionServer]):
             sql = (
                 f"INSERT INTO {self.table_name} "
                 "(server_id, name, status, source, total_quota, running_count, "
-                "env_info, last_heartbeat, connected, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "env_info, last_heartbeat, connected, updated_at, tenant_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON DUPLICATE KEY UPDATE name=VALUES(name), status=VALUES(status), "
                 "source=VALUES(source), total_quota=VALUES(total_quota), "
                 "running_count=VALUES(running_count), env_info=VALUES(env_info), "
                 "last_heartbeat=VALUES(last_heartbeat), connected=VALUES(connected), "
-                "updated_at=VALUES(updated_at)"
+                "updated_at=VALUES(updated_at), tenant_id=VALUES(tenant_id)"
             )
         else:  # sqlite
             sql = (
                 f"INSERT OR REPLACE INTO {self.table_name} "
                 "(server_id, name, status, source, total_quota, running_count, "
-                "env_info, last_heartbeat, connected, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                "env_info, last_heartbeat, connected, updated_at, tenant_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             )
 
         values = (server_id, name or server_id, status, source, int(total_quota),
-                  int(running_count), env_json, hb, bool(connected), now)
+                  int(running_count), env_json, hb, bool(connected), now, tenant_id)
 
         from ..connection import get_connection_manager
         cm = get_connection_manager()
@@ -165,6 +166,21 @@ class ExecutionServerRepository(BaseRepository[ExecutionServer]):
         with cm.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(sql, (False,))
+            conn.commit()
+            return cursor.rowcount
+
+    def delete_offline_by_tenant(self, tenant_id: str) -> int:
+        """Delete disconnected servers for a specific tenant.
+
+        Returns the count deleted.
+        """
+        ph = self.placeholder
+        sql = f"DELETE FROM {self.table_name} WHERE connected={ph} AND (tenant_id={ph} OR tenant_id IS NULL)"
+        from ..connection import get_connection_manager
+        cm = get_connection_manager()
+        with cm.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, (False, tenant_id))
             conn.commit()
             return cursor.rowcount
 

@@ -21,6 +21,7 @@ class HumanTask(BaseModel):
         "parent_task_id": str,
         "arrived_at": str,     # ISO timestamp
         "status": str,         # 'pending' | 'submitted'
+        "tenant_id": str,      # 租户 ID（来自 API Key）
     }
     __default_order__ = "id ASC"
 
