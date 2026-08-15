@@ -17,7 +17,7 @@ class LLMClient:
         self.api_key = os.getenv("DASHSCOPE_API_KEY")
         self.base_url = os.getenv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
         self.model = os.getenv("LLM_MODEL", "qwen-plus")
-        self.max_tokens = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+        self.max_tokens = int(os.getenv("LLM_MAX_TOKENS", "65535"))
         self.enable_thinking = os.getenv("LLM_ENABLE_THINKING", "true").lower() == "true"
         self.timeout = int(os.getenv("LLM_TIMEOUT", "120"))  # 默认 120 秒超时
 

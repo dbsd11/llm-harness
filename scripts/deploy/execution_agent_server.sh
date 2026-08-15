@@ -79,7 +79,7 @@ fi
 # LLM config (first deploy; otherwise preserved via --env-file)
 LLM_BASE_URL="${LLM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
 LLM_MODEL="${LLM_MODEL:-qwen-plus}"
-LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-4096}"
+LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-65535}"
 LLM_ENABLE_THINKING="${LLM_ENABLE_THINKING:-true}"
 LLM_TIMEOUT="${LLM_TIMEOUT:-120}"
 

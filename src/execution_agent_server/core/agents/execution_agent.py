@@ -154,30 +154,33 @@ class ExecutionAgent(BaseAgent):
 
     def _judge_task_success(self, goal: str, output: str,
                             task_id: str) -> tuple:
-        """Judge whether the task output is correct via LLM evaluation.
+        """Score task output relevance to goal on a 0-100 scale.
 
-        Only the final output correctness matters — tool call failures,
-        script errors, and intermediate failures do not determine success.
+        Score >= 80 → success. Below 80 → failure.
 
         Returns:
             (success: bool, error_msg: str or None)
         """
         judge_prompt = (
-            "你是一个任务执行结果评判员。请根据以下信息判断任务是否真正成功完成。\n\n"
+            "你是一个任务执行结果评判员。请对 Agent 的输出与任务目标的相关性和完成度打分（0-100）。\n\n"
             f"【任务目标】\n{goal}\n\n"
-            f"【Agent 输出】\n{output[:3000]}\n\n"
-            "【评判标准】\n"
-            "1. 任务是否被实际执行（而非仅提供建议或命令示例）\n"
-            "2. 输出内容是否基于实际执行结果（而非推断、猜测或语义分析）\n"
-            "3. 是否明确承认无法完成任务（如缺少资源、权限不足、上下文不足等）\n"
-            "4. 输出是否包含明显的幻觉内容（如编造的数据、未实际获取的信息）\n\n"
-            "【判断规则】\n"
-            "- 如果 agent 承认无法获取所需资源但仍生成了基于推断的内容 → 失败\n"
-            "- 如果 agent 明确报告任务失败且未生成虚假内容 → 失败\n"
-            "- 如果 agent 实际执行了任务并返回了基于真实执行的结果 → 成功\n"
-            "- 如果输出包含\"无法完成任务\"、\"上下文不足\"、\"无法获取\"等明确表示失败的内容 → 失败\n\n"
+            f"【Agent 输出】\n{output[:8000]}\n\n"
+            "【评分维度】\n"
+            "1. 目标覆盖度（40分）：输出是否涵盖了任务目标要求的主要内容\n"
+            "2. 实际执行证据（30分）：输出是否包含实际执行命令的结果（如 git clone 输出、文件内容、命令输出等）\n"
+            "3. 信息相关性（20分）：输出内容是否与任务目标直接相关，而非无关信息\n"
+            "4. 结构完整性（10分）：输出是否有合理的结构和组织\n\n"
+            "【评分规则】\n"
+            "- 90-100：完整覆盖目标，有明确执行证据，内容高度相关\n"
+            "- 80-89：基本覆盖目标，有执行证据，个别细节可能不精确但不影响整体\n"
+            "- 60-79：部分覆盖目标，有一定执行证据但不够完整\n"
+            "- 0-59：严重偏离目标，或明显未实际执行，或大量幻觉内容\n\n"
+            "【注意】\n"
+            "- 不要因为个别版本号、日期等细节无法验证就大幅扣分\n"
+            "- 重点关注输出是否实际回应了任务目标的核心需求\n"
+            "- 如果 Agent 实际执行了命令（如 git clone）并基于结果生成了报告，即使部分细节有偏差，也应给较高分\n\n"
             "请严格按以下 JSON 格式回复，不要包含其他内容：\n"
-            '{"success": true/false, "reason": "简短判断理由"}'
+            '{"score": 0-100, "reason": "简短评分理由"}'
         )
 
         try:
@@ -188,21 +191,21 @@ class ExecutionAgent(BaseAgent):
             response = llm_client.chat(messages, temperature=0.1)
             if response:
                 text = response.strip()
-                # Extract JSON from possible markdown wrapping
                 if "```" in text:
                     text = text.split("```")[1]
                     if text.startswith("json"):
                         text = text[4:]
                     text = text.strip()
                 judgment = json.loads(text)
-                success = judgment.get("success", True)
+                score = judgment.get("score", 0)
                 reason = judgment.get("reason", "")
+                success = score >= 80
                 logger.info(
-                    f"Task {task_id} LLM judgment: success={success}, "
-                    f"reason={reason}"
+                    f"Task {task_id} LLM judgment: score={score}, "
+                    f"success={success}, reason={reason}"
                 )
                 if not success:
-                    return False, f"结果评判为失败: {reason}"
+                    return False, f"结果评判得分 {score}/100 (低于80分): {reason}"
                 return True, None
         except (json.JSONDecodeError, KeyError) as e:
             logger.warning(f"Failed to parse LLM judgment for {task_id}: {e}")
