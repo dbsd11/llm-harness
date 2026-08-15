@@ -1,5 +1,6 @@
 # Execution Agent - ReAct agent with bash tool
 import json
+import os
 import subprocess
 from typing import Dict, Any, List, Optional
 from .base_agent import BaseAgent
@@ -78,6 +79,28 @@ def _execute_bash(command: str, timeout: int = _DEFAULT_CMD_TIMEOUT) -> dict:
         }
 
 
+def _write_upstream_files(upstream: List[str], task_id: str) -> List[str]:
+    """Write upstream outputs to /data/upstream/ for on-demand grep retrieval.
+
+    Returns list of file paths written.
+    """
+    if not upstream:
+        return []
+    upstream_dir = "/data/upstream"
+    os.makedirs(upstream_dir, exist_ok=True)
+    paths = []
+    for i, content in enumerate(upstream):
+        path = os.path.join(upstream_dir, f"task_{i}.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        paths.append(path)
+        logger.info(
+            f"Wrote upstream output {i} ({len(content)} chars) to {path} "
+            f"for task {task_id}"
+        )
+    return paths
+
+
 class ExecutionAgent(BaseAgent):
     """
     Execution Agent: ReAct loop with bash tool.
@@ -113,8 +136,10 @@ class ExecutionAgent(BaseAgent):
             server_id = context.get("server_id", "")
             logger.info(f"ExecutionAgent (ReAct) processing: {question[:100]}...")
 
+            upstream_files = _write_upstream_files(upstream, task_id)
+
             loop_result = self._react_loop(
-                task_id, question, upstream, server_id=server_id)
+                task_id, question, upstream_files, server_id=server_id)
             output = loop_result["output"]
 
             success, error_msg = self._judge_task_success(
@@ -217,7 +242,7 @@ class ExecutionAgent(BaseAgent):
         return True, None
 
     def _react_loop(self, task_id: str, question: str,
-                    upstream: List[str], server_id: str = "") -> dict:
+                    upstream_files: List[str], server_id: str = "") -> dict:
         """ReAct loop: reason -> act (tool) -> observe -> repeat.
 
         Returns:
@@ -235,14 +260,17 @@ class ExecutionAgent(BaseAgent):
             "6. 最终答案应包含实际执行命令的完整输出结果\n\n"
             "【反幻觉规则 — 最高优先级】\n"
             "1. 所有输出必须严格基于 run_bash 的实际执行结果\n"
-            "2. 禁止凭推断、猜测、记忆或语义分析生成任何事实性内容（包括版本号、文件路径、代码片段、配置项等）\n"
-            "3. 如果无法获取所需资源（如 git clone 失败、文件不存在），必须立即停止并报告失败原因\n"
-            "4. 禁止在无法访问实际数据的情况下生成报告、分析或任何实质性内容\n"
+            "2. 禁止凭推断、猜测、记忆或语义分析生成任何事实性内容\n"
+            "3. 如果无法获取所需资源，必须立即停止并报告失败原因\n"
+            "4. 禁止在无法访问实际数据的情况下生成报告或分析\n"
             "5. 宁可报告任务未完成，也不要生成基于猜测的虚假结果\n\n"
             "【文件输出】\n"
-            "- 所有生成的文件必须保存到 /data 目录，禁止保存到 /tmp 或 /app\n"
-            "- 保存文件后，必须用 cat 命令读取文件内容，并将完整内容作为最终回答的一部分输出\n"
-            "- 禁止只列出文件路径而不展示文件内容\n\n"
+            "- 生成的文件保存到 /data 目录\n"
+            "- 保存后用 cat 读取文件内容，将完整内容包含在最终回答中\n\n"
+            "【信息检索】\n"
+            "- 使用 grep -n '关键词' /data/upstream/*.md 检索前序任务输出中的关键信息\n"
+            "- 使用 cat /data/upstream/task_N.md 读取完整的前序任务输出\n"
+            "- 按需检索，不要一次性读取所有文件\n\n"
             "【工具额度】最多 20 次 run_bash 调用，收集够信息后直接给出完整答案。\n"
         )
 
@@ -250,16 +278,11 @@ class ExecutionAgent(BaseAgent):
         system_msg += f"\n【当前角色】\n{self.system_prompt}"
         if server_id:
             system_msg += f"\n\n【执行环境】服务器 ID：`{server_id}`"
-        if upstream:
-            system_msg += "\n\n【前序任务输出（摘要）】\n"
-            system_msg += "（以下为前序任务输出的前 5000 字符摘要，完整内容可用 cat 从 /data 目录读取）\n"
-            truncated = []
-            for i, out in enumerate(upstream):
-                snippet = out[:5000]
-                if len(out) > 5000:
-                    snippet += f"\n... [截断，原文 {len(out)} 字符]"
-                truncated.append(snippet)
-            system_msg += "\n---\n".join(truncated)
+        if upstream_files:
+            system_msg += "\n\n【前序任务输出文件】\n"
+            system_msg += "以下文件包含前序任务的完整输出，使用 grep/cat 按需检索：\n"
+            for path in upstream_files:
+                system_msg += f"- {path}\n"
 
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_msg},
