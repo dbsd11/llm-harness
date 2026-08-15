@@ -1,5 +1,11 @@
 FROM python:3.11-slim
 
+# Use Aliyun mirror for faster apt downloads from China
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' \
+    /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null; \
+    sed -i 's|deb.debian.org|mirrors.aliyun.com|g' \
+    /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+
 # git: execution agent bash tasks need git clone/pull/etc.
 # bash: execution_agent.py uses executable="/bin/bash"
 # curl: health checks and API calls
