@@ -26,7 +26,13 @@ class HumanAgentClient:
     """
 
     def __init__(self):
-        self._server_id = os.getenv("HUMAN_AGENT_DEFAULT_ID", "human-1")
+        explicit_id = os.getenv("HUMAN_AGENT_DEFAULT_ID", "")
+        if explicit_id:
+            self._server_id = explicit_id
+        else:
+            from core.local_tenant import get_tenant_id
+            tid = get_tenant_id()
+            self._server_id = f"human-{tid}" if tid else "human-1"
         self._total_quota = int(os.getenv("HUMAN_AGENT_QUOTA", "8"))
         # Agent connection uses root path (not /subscribe)
         self._ws_url = os.getenv("WS_SERVER_WS_URL", "wss://agent-socket-server.bdzz.com.cn:8765")
@@ -123,7 +129,7 @@ class HumanAgentClient:
                 _headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
                 async with websockets.connect(
                     self._ws_url, max_size=None, ssl=_ssl,
-                    extra_headers=_headers,
+                    additional_headers=_headers,
                 ) as ws:
                     self._ws = ws
                     backoff = 1

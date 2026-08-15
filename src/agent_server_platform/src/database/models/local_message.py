@@ -18,6 +18,7 @@ class Message(BaseModel):
         "content": str,      # JSON string with full message payload
         "timestamp": datetime,
         "acked": int,        # dispatch only: 0=unacked, 1=acked (ack-after-execute)
+        "tenant_id": str,
     }
     __default_order__ = "timestamp DESC"
 

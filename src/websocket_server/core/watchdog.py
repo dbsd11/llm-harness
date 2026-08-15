@@ -82,10 +82,11 @@ class Watchdog:
             elapsed = (now - started_at).total_seconds()
             if elapsed > timeout_seconds:
                 logger.warning(f"Task {task.task_id} timed out after {elapsed:.1f}s")
+                _tid = getattr(task, 'tenant_id', None)
                 event_bus.emit("watchdog.timeout_detected", {
                     "task_id": task.task_id,
                     "elapsed_seconds": elapsed,
-                })
+                }, tenant_id=_tid)
 
                 # Attempt recovery
                 self._attempt_recovery(task.task_id, task)
@@ -100,6 +101,7 @@ class Watchdog:
         """
         retry_count = task.retry_count or 0
         max_retries = task.max_retries or 3
+        _tid = getattr(task, 'tenant_id', None)
 
         if retry_count < max_retries:
             # Retry: transition to PENDING, increment retry_count
@@ -110,7 +112,7 @@ class Watchdog:
                 "task_id": task_id,
                 "action": "retry",
                 "retry_count": retry_count + 1,
-            })
+            }, tenant_id=_tid)
         else:
             # Give up: transition to TIMEOUT
             logger.error(f"Task {task_id} exceeded max retries, marking as TIMEOUT")
@@ -118,7 +120,7 @@ class Watchdog:
             event_bus.emit("watchdog.recovery_failed", {
                 "task_id": task_id,
                 "reason": "max_retries_exceeded",
-            })
+            }, tenant_id=_tid)
 
 
 # Global watchdog instance

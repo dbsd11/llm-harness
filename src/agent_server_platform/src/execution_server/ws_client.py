@@ -51,7 +51,7 @@ class WSClient:
                 # wss:// 自签名证书：客户端跳过校验；ws:// 不传 ssl
                 _ssl = ssl._create_unverified_context() if url.startswith("wss") else None
                 _headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
-                async with websockets.connect(url, max_size=None, ssl=_ssl, extra_headers=_headers) as ws:
+                async with websockets.connect(url, max_size=None, ssl=_ssl, additional_headers=_headers) as ws:
                     self._ws = ws
                     await ws.send(P.register_frame(
                         self.cfg["server_id"],

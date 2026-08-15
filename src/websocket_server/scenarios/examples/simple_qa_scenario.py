@@ -32,10 +32,11 @@ class SimpleQAScenario(BaseScenario):
 
     def run(self) -> Dict[str, Any]:
         """Execute QA workflow"""
+        _tid = self.context.config.get("tenant_id") if self.context.config else None
         event_bus.emit("scenario.qa_started", {
             "scenario_id": self.context.scenario_id,
             "question": self.question,
-        })
+        }, tenant_id=_tid)
 
         try:
             # Submit task to scheduling agent
@@ -58,7 +59,7 @@ class SimpleQAScenario(BaseScenario):
                 "scenario_id": self.context.scenario_id,
                 "task_id": task_id,
                 "task_state": task_result["state"],
-            })
+            }, tenant_id=_tid)
 
             return {
                 "success": task_result["state"] == "success",
@@ -76,7 +77,7 @@ class SimpleQAScenario(BaseScenario):
             event_bus.emit("scenario.qa_failed", {
                 "scenario_id": self.context.scenario_id,
                 "error": error_msg,
-            })
+            }, tenant_id=_tid)
 
             return {
                 "success": False,

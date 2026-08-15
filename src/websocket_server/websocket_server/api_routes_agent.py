@@ -39,15 +39,15 @@ async def list_agents(request: web.Request) -> web.Response:
     status = request.query.get("status")
     limit = int(request.query.get("limit", "200"))
     tenant_id = request.get("tenant_id")
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
 
     try:
         repo = AgentRepository()
         if agent_type:
             agents = await run_in_db_thread(lambda: repo.find_by_type(agent_type, tenant_id=tenant_id))
-        elif tenant_id:
-            agents = await run_in_db_thread(lambda: repo.find_all_by_tenant(tenant_id, limit=limit))
         else:
-            agents = await run_in_db_thread(lambda: repo.find_all(limit=limit))
+            agents = await run_in_db_thread(lambda: repo.find_all_by_tenant(tenant_id, limit=limit))
 
         if status and status != "all":
             agents = [a for a in agents if a.status == status]

@@ -33,6 +33,7 @@ def _task_to_dict(t) -> dict:
         "agent_role": t.agent_role,
         "execution_duration": t.execution_duration,
         "review_feedback": t.review_feedback,
+        "tenant_id": getattr(t, 'tenant_id', None),
         "context": json.loads(t.context) if t.context else {},
         "result": json.loads(t.result) if t.result else None,
         "error": t.error,
@@ -49,6 +50,8 @@ async def list_tasks(request: web.Request) -> web.Response:
     state = request.query.get("state")
     limit = int(request.query.get("limit", "100"))
     tenant_id = request.get("tenant_id")
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
 
     try:
         repo = TaskRepository()
@@ -56,10 +59,8 @@ async def list_tasks(request: web.Request) -> web.Response:
             tasks = await run_in_db_thread(lambda: repo.find_by_scenario_id(scenario_id, tenant_id=tenant_id))
         elif state:
             tasks = await run_in_db_thread(lambda: repo.find_by_state(state, tenant_id=tenant_id))
-        elif tenant_id:
-            tasks = await run_in_db_thread(lambda: repo.find_all_by_tenant(tenant_id, limit=limit))
         else:
-            tasks = await run_in_db_thread(lambda: repo.find_all(limit=limit))
+            tasks = await run_in_db_thread(lambda: repo.find_all_by_tenant(tenant_id, limit=limit))
 
         return web.json_response({
             "success": True,

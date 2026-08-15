@@ -52,9 +52,15 @@ WF_EMPTY_PREVIEW = "暂无 Workflow 草稿。通过对话描述想创建的 Work
 
 # ── 上下文采集 ─────────────────────────────────────────────────────────────
 
-def gather_scene_index() -> str:
+def _fetch_servers(tenant_id: str) -> list:
+    """查询一次本租户的全部 execution servers，供同一次请求内的多个消费者复用。"""
+    from database.repositories.execution_server_repository import ExecutionServerRepository
+    return ExecutionServerRepository().find_all_by_tenant(tenant_id)
+
+
+def gather_scene_index(tenant_id: str) -> str:
     """返回现有场景清单文本，注入 system prompt 供助手回答场景相关问题。"""
-    scenarios = ScenarioRepository().find_all()
+    scenarios = ScenarioRepository().find_all_by_tenant(tenant_id)
     if not scenarios:
         return "（当前数据库中没有任何场景）"
     lines = []
@@ -65,21 +71,14 @@ def gather_scene_index() -> str:
     return "\n".join(lines)
 
 
-def gather_human_servers() -> str:
-    """返回已注册的人工 Agent 服务器清单，供 LLM 在配置 execution_agents 时引用 server_id。
-
-    ponytail: query local DB directly — this runs inside ws_server, not the platform.
-    HTTP self-call to public IP times out inside the container.
-    """
-    from database.repositories.execution_server_repository import ExecutionServerRepository
-
+def gather_human_servers(tenant_id: str, _servers: list = None) -> str:
+    """返回已注册的人工 Agent 服务器清单，供 LLM 在配置 execution_agents 时引用 server_id。"""
     try:
-        servers = ExecutionServerRepository().list_all()
+        servers = _servers if _servers is not None else _fetch_servers(tenant_id)
     except Exception as e:
         logger.warning(f"Failed to query execution servers from local DB: {e}")
         return "（无法获取人工 Agent 服务器列表）"
 
-    # 显示所有注册的人工 Agent（包括离线的），让 LLM 知道有哪些可用
     human = [s for s in servers if getattr(s, 'source', '') == 'human_agent']
     if not human:
         return "（当前没有已注册的人工 Agent 服务器）"
@@ -89,15 +88,10 @@ def gather_human_servers() -> str:
     return "\n".join(lines)
 
 
-def gather_execution_servers() -> str:
-    """返回已注册的执行 Agent 服务器清单（含在线状态），供 LLM 准确分配 server_id。
-
-    ponytail: query local DB directly — this runs inside ws_server, not the platform.
-    """
-    from database.repositories.execution_server_repository import ExecutionServerRepository
-
+def gather_execution_servers(tenant_id: str, _servers: list = None) -> str:
+    """返回已注册的执行 Agent 服务器清单（含在线状态），供 LLM 准确分配 server_id。"""
     try:
-        servers = ExecutionServerRepository().list_all()
+        servers = _servers if _servers is not None else _fetch_servers(tenant_id)
     except Exception as e:
         logger.warning(f"Failed to query execution servers from local DB: {e}")
         return "（无法获取执行服务器列表）"
@@ -114,28 +108,27 @@ def gather_execution_servers() -> str:
     return "\n".join(lines)
 
 
-def get_known_server_ids() -> set:
+def get_known_server_ids(tenant_id: str, _servers: list = None) -> set:
     """返回所有已注册的服务器 ID 集合（用于校验 scene-spec 中的 server_id）。"""
-    from database.repositories.execution_server_repository import ExecutionServerRepository
-
     try:
-        servers = ExecutionServerRepository().list_all()
+        servers = _servers if _servers is not None else _fetch_servers(tenant_id)
         return {s.server_id for s in servers if getattr(s, 'server_id', '')}
     except Exception:
         return set()
 
 
-def summarize_scenario(scenario_id: str) -> str:
+def summarize_scenario(scenario_id: str, tenant_id: str) -> str:
     """把场景元信息 + 对话历史压缩为可读文本，供 LLM 总结。
 
     复用 export_html.build_message_history：messages(dispatch/reply) + events
     已聚合成中文业务语义时间线。历史过长则截断最近 N 条。
     """
     repo = ScenarioRepository()
-    # 支持用户输入前 8 位前缀匹配
     scenario = repo.find_by_scenario_id(scenario_id)
+    if scenario and scenario.tenant_id and scenario.tenant_id != tenant_id:
+        scenario = None
     if not scenario and len(scenario_id) >= 4:
-        for s in repo.find_all():
+        for s in repo.find_all_by_tenant(tenant_id):
             if (s.scenario_id or "").startswith(scenario_id):
                 scenario = s
                 break
@@ -238,14 +231,15 @@ def validate_scene_spec(spec: Dict[str, Any]) -> Tuple[bool, str]:
     return True, ""
 
 
-def check_server_id_warnings(spec: Dict[str, Any]) -> str:
+def check_server_id_warnings(spec: Dict[str, Any], tenant_id: str,
+                             _servers: list = None) -> str:
     """检查 spec 中 execution_agents 的 server_id 是否匹配已知服务器，返回警告文本（空串表示无警告）。"""
     roles = (spec.get("config") or {}).get("agent_roles") or {}
     exec_agents = roles.get("execution_agents") or []
     used_ids = {a.get("server_id") for a in exec_agents if isinstance(a, dict) and a.get("server_id")}
     if not used_ids:
         return ""
-    known = get_known_server_ids()
+    known = get_known_server_ids(tenant_id, _servers)
     if not known:
         return ""
     bad = used_ids - known
@@ -258,7 +252,8 @@ def _exec_agent_ok(a: Any) -> bool:
     return isinstance(a, dict) and bool(a.get("name")) and bool(a.get("role"))
 
 
-def render_preview(spec: Optional[Dict[str, Any]]) -> str:
+def render_preview(spec: Optional[Dict[str, Any]], tenant_id: str,
+                   _servers: list = None) -> str:
     """把草稿渲染为中文 Markdown 预览。"""
     if not spec:
         return EMPTY_PREVIEW
@@ -294,7 +289,7 @@ def render_preview(spec: Optional[Dict[str, Any]]) -> str:
     if config.get("manual_acceptance"):
         lines.append("- **人工验收**：已启用")
     ok, err = validate_scene_spec(spec)
-    sid_warn = check_server_id_warnings(spec)
+    sid_warn = check_server_id_warnings(spec, tenant_id, _servers)
     lines.append("")
     if sid_warn:
         lines.append(f"> {sid_warn}")
@@ -305,7 +300,8 @@ def render_preview(spec: Optional[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def save_scene(spec: Dict[str, Any], scenario_id: str = None) -> Tuple[Optional[str], str]:
+def save_scene(spec: Dict[str, Any], scenario_id: str,
+              tenant_id: str, _servers: list = None) -> Tuple[Optional[str], str]:
     """校验通过后落库。
 
     - scenario_id 为空：新建场景，返回新 id。
@@ -315,13 +311,13 @@ def save_scene(spec: Dict[str, Any], scenario_id: str = None) -> Tuple[Optional[
     ok, err = validate_scene_spec(spec)
     if not ok:
         return None, err
-    sid_warn = check_server_id_warnings(spec)
+    sid_warn = check_server_id_warnings(spec, tenant_id, _servers)
     if sid_warn:
         return None, sid_warn
     try:
         if scenario_id:
             # 仅允许修改初始化状态的场景
-            existing = ScenarioRepository().find_by_scenario_id(scenario_id)
+            existing = _resolve_scenario(scenario_id, tenant_id)
             if not existing:
                 return None, f"未找到场景：{scenario_id}（可能已被删除）"
             if existing.state != "initializing":
@@ -332,6 +328,7 @@ def save_scene(spec: Dict[str, Any], scenario_id: str = None) -> Tuple[Optional[
                 name=spec["name"],
                 description=spec.get("description", "") or "",
                 config=spec.get("config") or {},
+                tenant_id=tenant_id,
             )
             if not updated:
                 return None, f"未找到场景：{scenario_id}（可能已被删除）"
@@ -341,15 +338,16 @@ def save_scene(spec: Dict[str, Any], scenario_id: str = None) -> Tuple[Optional[
             spec["name"],
             spec.get("description", "") or "",
             spec.get("config") or {},
+            tenant_id=tenant_id,
         ), ""
     except Exception as e:
         logger.error(f"save_scene 失败: {e}")
         return None, f"保存失败：{e}"
 
 
-def load_scenario_spec(scenario_id: str) -> Optional[Dict[str, Any]]:
+def load_scenario_spec(scenario_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
     """从数据库重建草稿 spec（用于「放弃修改」回退到已保存版本）。"""
-    scenario = ScenarioRepository().find_by_scenario_id(scenario_id)
+    scenario = _resolve_scenario(scenario_id, tenant_id)
     if not scenario:
         return None
     try:
@@ -366,27 +364,30 @@ def load_scenario_spec(scenario_id: str) -> Optional[Dict[str, Any]]:
 
 # ── Workflow 草稿解析 / 校验 / 落库 ──────────────────────────────────────────
 
-def gather_workflow_index() -> str:
+def gather_workflow_index(tenant_id: str) -> str:
     """返回现有 Workflow 清单文本，注入 system prompt。"""
-    workflows = WorkflowRepository().find_all()
+    workflows = WorkflowRepository().find_all_by_tenant(tenant_id)
     if not workflows:
         return "（当前数据库中没有任何 Workflow）"
     template_repo = WorkflowTaskTemplateRepository()
+    wf_ids = [w.workflow_id for w in workflows if w.workflow_id]
+    step_counts = template_repo.count_by_workflow_ids(wf_ids)
     lines = []
     for w in workflows:
         wid = (w.workflow_id or "")[:8]
-        templates = template_repo.find_by_workflow_id(w.workflow_id)
-        step_count = len(templates)
+        step_count = step_counts.get(w.workflow_id, 0)
         lines.append(f"- [{wid}] {w.name or '未命名'} | 状态:{w.state or '?'} | v{w.version or 1} | {step_count} 步")
     return "\n".join(lines)
 
 
-def summarize_workflow(workflow_id: str) -> str:
+def summarize_workflow(workflow_id: str, tenant_id: str) -> str:
     """把 Workflow 元信息 + DAG 结构压缩为可读文本，供 LLM 回答 Workflow 相关问题。"""
     repo = WorkflowRepository()
     wf = repo.find_by_workflow_id(workflow_id)
+    if wf and wf.tenant_id and wf.tenant_id != tenant_id:
+        wf = None
     if not wf and len(workflow_id) >= 4:
-        for w in repo.find_all():
+        for w in repo.find_all_by_tenant(tenant_id):
             if (w.workflow_id or "").startswith(workflow_id):
                 wf = w
                 break
@@ -427,7 +428,7 @@ def summarize_workflow(workflow_id: str) -> str:
         lines.append("（暂无步骤）")
 
     if wf.source_scenario_id:
-        scenario = ScenarioRepository().find_by_scenario_id(wf.source_scenario_id)
+        scenario = _resolve_scenario(wf.source_scenario_id, tenant_id)
         if scenario:
             try:
                 config = json.loads(scenario.config or "{}")
@@ -537,14 +538,15 @@ def _has_cycle(steps: List[Dict]) -> bool:
     return visited < len(step_ids)
 
 
-def check_workflow_server_id_warnings(spec: Dict[str, Any]) -> str:
+def check_workflow_server_id_warnings(spec: Dict[str, Any], tenant_id: str,
+                                      _servers: list = None) -> str:
     """检查 workflow steps 中的 server_id 是否匹配已知服务器。"""
     steps = spec.get("steps") or []
     used_ids = {s.get("server_id") for s in steps
                 if isinstance(s, dict) and s.get("server_id")}
     if not used_ids:
         return ""
-    known = get_known_server_ids()
+    known = get_known_server_ids(tenant_id, _servers)
     if not known:
         return ""
     bad = used_ids - known
@@ -553,7 +555,8 @@ def check_workflow_server_id_warnings(spec: Dict[str, Any]) -> str:
     return ""
 
 
-def render_workflow_preview(spec: Optional[Dict[str, Any]]) -> str:
+def render_workflow_preview(spec: Optional[Dict[str, Any]], tenant_id: str,
+                            _servers: list = None) -> str:
     """把 Workflow 草稿渲染为中文 Markdown 预览。"""
     if not spec:
         return WF_EMPTY_PREVIEW
@@ -599,7 +602,7 @@ def render_workflow_preview(spec: Optional[Dict[str, Any]]) -> str:
                 lines.append(f"  - `{sid}` [{role}]: {goal}{dep_str}{srv_str}")
 
     ok, err = validate_workflow_spec(spec)
-    sid_warn = check_workflow_server_id_warnings(spec)
+    sid_warn = check_workflow_server_id_warnings(spec, tenant_id, _servers)
     lines.append("")
     if sid_warn:
         lines.append(f"> {sid_warn}")
@@ -610,12 +613,13 @@ def render_workflow_preview(spec: Optional[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def save_workflow(spec: Dict[str, Any], workflow_id: str = None) -> Tuple[Optional[str], str]:
+def save_workflow(spec: Dict[str, Any], workflow_id: str,
+                  tenant_id: str, _servers: list = None) -> Tuple[Optional[str], str]:
     """校验通过后落库。创建新 Workflow + WorkflowTaskTemplate 记录，或更新已有记录。"""
     ok, err = validate_workflow_spec(spec)
     if not ok:
         return None, err
-    sid_warn = check_workflow_server_id_warnings(spec)
+    sid_warn = check_workflow_server_id_warnings(spec, tenant_id, _servers)
     if sid_warn:
         return None, sid_warn
 
@@ -632,7 +636,7 @@ def save_workflow(spec: Dict[str, Any], workflow_id: str = None) -> Tuple[Option
         dag_definition = json.dumps({"steps": steps}, ensure_ascii=False)
 
         if workflow_id:
-            existing = _resolve_workflow(workflow_id)
+            existing = _resolve_workflow(workflow_id, tenant_id)
             if not existing:
                 return None, f"未找到 Workflow：{workflow_id}"
             full_wf_id = existing.workflow_id
@@ -665,6 +669,7 @@ def save_workflow(spec: Dict[str, Any], workflow_id: str = None) -> Tuple[Option
                 version=1,
                 state="active",
                 created_by="assistant",
+                tenant_id=tenant_id,
                 created_at=now,
                 updated_at=now,
             )
@@ -703,9 +708,9 @@ def _create_templates(tpl_repo, workflow_id: str, steps: List[Dict],
         tpl_repo.create(template)
 
 
-def load_workflow_spec(workflow_id: str) -> Optional[Dict[str, Any]]:
+def load_workflow_spec(workflow_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
     """从数据库重建 Workflow spec dict。支持前缀匹配。"""
-    wf = _resolve_workflow(workflow_id)
+    wf = _resolve_workflow(workflow_id, tenant_id)
     if not wf:
         return None
 
@@ -746,21 +751,22 @@ def load_workflow_spec(workflow_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def _resolve_workflow(workflow_id: str):
+def _resolve_workflow(workflow_id: str, tenant_id: str):
     """按完整 id 或前缀解析 Workflow，返回 Workflow 或 None。"""
     repo = WorkflowRepository()
     w = repo.find_by_workflow_id(workflow_id)
-    if w:
-        return w
-    if len(workflow_id) >= 4:
-        for c in repo.find_all():
+    if w and w.tenant_id and w.tenant_id != tenant_id:
+        w = None
+    if not w and len(workflow_id) >= 4:
+        for c in repo.find_all_by_tenant(tenant_id):
             if (c.workflow_id or "").startswith(workflow_id):
                 return c
-    return None
+    return w
 
 
 def _detect_workflow_edit(user_text: str, saved_wf_id: Optional[str],
-                          pending_wf: Optional[Dict[str, Any]]
+                          pending_wf: Optional[Dict[str, Any]],
+                          tenant_id: str,
                           ) -> Tuple[Optional[str], Optional[str]]:
     """检测用户是否要修改已有 Workflow。返回 (workflow_id, error)。"""
     wf_keywords = ("workflow", "工作流", "dag", "流程")
@@ -774,13 +780,13 @@ def _detect_workflow_edit(user_text: str, saved_wf_id: Optional[str],
         return None, None
 
     if saved_wf_id and pending_wf:
-        cur = _resolve_workflow(saved_wf_id)
+        cur = _resolve_workflow(saved_wf_id, tenant_id)
         if cur:
             if (cur.workflow_id == target or cur.workflow_id.startswith(target)
                     or target.startswith(cur.workflow_id[:len(target)])):
                 return None, None
 
-    wf = _resolve_workflow(target)
+    wf = _resolve_workflow(target, tenant_id)
     if not wf:
         return None, None
     return wf.workflow_id, None
@@ -921,21 +927,31 @@ workflow-spec 格式：
 
 def _build_messages(user_text: str, history: List[Dict[str, Any]],
                     pending_scene: Optional[Dict[str, Any]],
-                    summary_content: Optional[str] = None,
-                    pending_workflow: Optional[Dict[str, Any]] = None,
+                    summary_content: Optional[str],
+                    pending_workflow: Optional[Dict[str, Any]],
+                    tenant_id: str,
+                    _servers: list = None,
                     ) -> List[Dict[str, str]]:
     """组装 LLM messages：system（含场景清单/聚焦/当前草稿）+ 历史 + 当前输入。"""
     sys = _SYSTEM_PROMPT
-    sys += "\n\n【场景清单】\n" + gather_scene_index()
-    sys += "\n\n【Workflow 清单】\n" + gather_workflow_index()
-    sys += "\n\n【可用执行 Agent 服务器】\n" + gather_execution_servers()
-    sys += "\n\n【可用人工 Agent 服务器】\n" + gather_human_servers()
+    sys += "\n\n【场景清单】\n" + gather_scene_index(tenant_id)
+    sys += "\n\n【Workflow 清单】\n" + gather_workflow_index(tenant_id)
 
-    focus = _maybe_focus(user_text)
+    if _servers is None:
+        try:
+            _servers = _fetch_servers(tenant_id)
+        except Exception as e:
+            logger.warning(f"Failed to query execution servers: {e}")
+            _servers = []
+
+    sys += "\n\n【可用执行 Agent 服务器】\n" + gather_execution_servers(tenant_id, _servers)
+    sys += "\n\n【可用人工 Agent 服务器】\n" + gather_human_servers(tenant_id, _servers)
+
+    focus = _maybe_focus(user_text, tenant_id)
     if focus:
         sys += "\n\n【场景聚焦】\n" + focus
 
-    wf_focus = _maybe_workflow_focus(user_text)
+    wf_focus = _maybe_workflow_focus(user_text, tenant_id)
     if wf_focus:
         sys += "\n\n【Workflow 聚焦】\n" + wf_focus
 
@@ -961,17 +977,17 @@ def _build_messages(user_text: str, history: List[Dict[str, Any]],
     return messages
 
 
-def _maybe_focus(user_text: str) -> str:
+def _maybe_focus(user_text: str, tenant_id: str) -> str:
     """用户输入中若含疑似 scenario_id（hex 片段≥4），注入该场景历史摘要。"""
     if not user_text:
         return ""
     m = _ID_RE.search(user_text)
     if not m:
         return ""
-    return summarize_scenario(m.group(1))
+    return summarize_scenario(m.group(1), tenant_id)
 
 
-def _maybe_workflow_focus(user_text: str) -> str:
+def _maybe_workflow_focus(user_text: str, tenant_id: str) -> str:
     """用户输入中若含 workflow 关键词 + 疑似 workflow_id，注入该 Workflow 详情。"""
     if not user_text:
         return ""
@@ -981,27 +997,28 @@ def _maybe_workflow_focus(user_text: str) -> str:
     m = _ID_RE.search(user_text)
     if not m:
         return ""
-    wf = _resolve_workflow(m.group(1))
+    wf = _resolve_workflow(m.group(1), tenant_id)
     if not wf:
         return ""
-    return summarize_workflow(wf.workflow_id)
+    return summarize_workflow(wf.workflow_id, tenant_id)
 
 
-def _resolve_scenario(scenario_id: str):
+def _resolve_scenario(scenario_id: str, tenant_id: str):
     """按完整 id 或前缀解析场景，返回 Scenario 或 None。"""
     repo = ScenarioRepository()
     s = repo.find_by_scenario_id(scenario_id)
-    if s:
-        return s
-    if len(scenario_id) >= 4:
-        for c in repo.find_all():
+    if s and s.tenant_id and s.tenant_id != tenant_id:
+        s = None
+    if not s and len(scenario_id) >= 4:
+        for c in repo.find_all_by_tenant(tenant_id):
             if (c.scenario_id or "").startswith(scenario_id):
                 return c
-    return None
+    return s
 
 
 def _detect_edit(user_text: str, saved_id: Optional[str],
-                 pending: Optional[Dict[str, Any]]
+                 pending: Optional[Dict[str, Any]],
+                 tenant_id: str,
                  ) -> Tuple[Optional[str], Optional[str]]:
     """检测用户是否要修改已有场景。
 
@@ -1021,14 +1038,14 @@ def _detect_edit(user_text: str, saved_id: Optional[str],
     # 已在编辑同一场景且已有草稿：保留当前草稿，不重复载入（避免丢弃用户改动）
     if saved_id and pending:
         try:
-            cur = _resolve_scenario(saved_id)
+            cur = _resolve_scenario(saved_id, tenant_id)
             if cur and (cur.scenario_id == target or cur.scenario_id.startswith(target)
                         or target.startswith(cur.scenario_id[:len(target)])):
                 return None, None
         except Exception:
             pass
 
-    scenario = _resolve_scenario(target)
+    scenario = _resolve_scenario(target, tenant_id)
     if not scenario:
         return None, None  # 找不到，交给 LLM 提示
     if scenario.state != "initializing":
@@ -1038,10 +1055,11 @@ def _detect_edit(user_text: str, saved_id: Optional[str],
 
 def reply(user_text: str, history: List[Dict[str, Any]],
           pending_scene: Optional[Dict[str, Any]],
-          saved_id: Optional[str] = None,
-          summary_content: Optional[str] = None,
-          pending_workflow: Optional[Dict[str, Any]] = None,
-          saved_workflow_id: Optional[str] = None,
+          saved_id: Optional[str],
+          summary_content: Optional[str],
+          pending_workflow: Optional[Dict[str, Any]],
+          saved_workflow_id: Optional[str],
+          tenant_id: str,
           ) -> Tuple[str, Optional[Dict[str, Any]], str, Optional[str],
                      Optional[Dict[str, Any]], Optional[str]]:
     """一帧对话。
@@ -1049,9 +1067,15 @@ def reply(user_text: str, history: List[Dict[str, Any]],
     返回 (assistant_text, new_pending_scene, scene_preview_md, new_saved_id,
           new_pending_workflow, new_saved_workflow_id)。
     """
+    try:
+        servers = _fetch_servers(tenant_id)
+    except Exception as e:
+        logger.warning(f"Failed to query execution servers: {e}")
+        servers = []
+
     if not llm_client.client:
         return ("⚠️ 未配置 LLM（DASHSCOPE_API_KEY 缺失），对话功能不可用。"
-                "请在 .env 配置后重启服务。"), pending_scene, render_preview(pending_scene), saved_id, \
+                "请在 .env 配置后重启服务。"), pending_scene, render_preview(pending_scene, tenant_id, servers), saved_id, \
             pending_workflow, saved_workflow_id
 
     new_saved_id = saved_id
@@ -1060,42 +1084,42 @@ def reply(user_text: str, history: List[Dict[str, Any]],
     new_saved_wf_id = saved_workflow_id
 
     # 修改已有场景：先载入全量配置
-    target, err = _detect_edit(user_text, saved_id, pending_scene)
+    target, err = _detect_edit(user_text, saved_id, pending_scene, tenant_id)
     if err and err.startswith("non-initializing"):
         state = err.split(":", 1)[1]
         return (f"⚠️ 该场景当前状态为「{state}」，仅 `initializing` 状态的场景可修改。"
                 "如需调整，请先在 Scenario Dashboard 停止/重建场景。"), \
-            pending_scene, render_preview(pending_scene), saved_id, \
+            pending_scene, render_preview(pending_scene, tenant_id, servers), saved_id, \
             pending_workflow, saved_workflow_id
 
     match = _ID_RE.search(user_text)
     if match and not target:
         potential_id = match.group(1)
-        scenario_repo = ScenarioRepository()
-        is_real_scenario = scenario_repo.find_by_scenario_id(potential_id) is not None
+        is_real_scenario = _resolve_scenario(potential_id, tenant_id) is not None
         is_viewing_scene = is_real_scenario
     else:
         is_viewing_scene = False
 
     if target:
-        loaded = load_scenario_spec(target)
+        loaded = load_scenario_spec(target, tenant_id)
         if loaded:
             new_pending = loaded
             new_saved_id = target
 
     # 修改已有 Workflow：载入全量配置
-    wf_target, wf_err = _detect_workflow_edit(user_text, saved_workflow_id, pending_workflow)
+    wf_target, wf_err = _detect_workflow_edit(user_text, saved_workflow_id, pending_workflow, tenant_id)
     if wf_target and not wf_err:
-        loaded_wf = load_workflow_spec(wf_target)
+        loaded_wf = load_workflow_spec(wf_target, tenant_id)
         if loaded_wf:
             new_pending_wf = loaded_wf
             new_saved_wf_id = wf_target
 
     messages = _build_messages(user_text, history, new_pending, summary_content,
-                               pending_workflow=new_pending_wf)
+                               pending_workflow=new_pending_wf, tenant_id=tenant_id,
+                               _servers=servers)
     raw = llm_client.chat(messages, 0.7)
     if not raw:
-        return "（助手暂时没有响应，请重试。）", new_pending, render_preview(new_pending), new_saved_id, \
+        return "（助手暂时没有响应，请重试。）", new_pending, render_preview(new_pending, tenant_id, servers), new_saved_id, \
             new_pending_wf, new_saved_wf_id
 
     visible = raw
@@ -1117,29 +1141,8 @@ def reply(user_text: str, history: List[Dict[str, Any]],
             new_pending_wf = wf_spec
         visible = _WF_SPEC_FENCE_RE.sub("", visible).strip()
 
-    return visible, new_pending, render_preview(new_pending), new_saved_id, \
+    return visible, new_pending, render_preview(new_pending, tenant_id, servers), new_saved_id, \
         new_pending_wf, new_saved_wf_id
-
-
-# ── SceneAssistant 类（依赖注入，便于测试） ──────────────────────────────────
-
-class SceneAssistant:
-    """面向调用方的场景助手封装，支持依赖注入。
-
-    将 LLM 与仓储抽象为参数，便于单测 mock。
-    """
-
-    def __init__(self, llm, repo):
-        self._llm = llm
-        self._repo = repo
-
-    def reply(self, user_text: str, session_id: str = "",
-              history: Optional[List[Dict[str, Any]]] = None,
-              summary_content: Optional[str] = None) -> str:
-        pending_scene = self._repo.find_pending_scene(session_id)
-        messages = _build_messages(user_text, history or [], pending_scene,
-                                   summary_content, pending_workflow=None)
-        return self._llm.chat(messages)
 
 
 # ── 自检 ───────────────────────────────────────────────────────────────────
@@ -1173,7 +1176,7 @@ if __name__ == "__main__":
     parsed = parse_scene_spec(sample)
     assert parsed and parsed["scenario_type"] == "simple_qa", "应从回复中解析出 scene-spec"
 
-    md = render_preview(good)
+    md = render_preview(good, "test-tenant", [])
     assert "✅" in md and "问答" in md, f"预览应含通过标记: {md}"
 
     # save_scene 路由 + 状态守卫：用桩替代 scenario_manager 与 ScenarioRepository，
@@ -1181,7 +1184,7 @@ if __name__ == "__main__":
     calls = {"create": 0, "update": 0}
 
     class _Stub:
-        def create_scenario(self, stype, name, desc, config, created_by=None):
+        def create_scenario(self, stype, name, desc, config, created_by=None, tenant_id=None):
             calls["create"] += 1
             return "new-id-123"
 
@@ -1198,6 +1201,7 @@ if __name__ == "__main__":
             self.name = "1+1 等于几"
             self.description = ""
             self.config = json.dumps(good["config"])
+            self.tenant_id = "test-tenant"
 
     TEST_ID = "abc12345def"  # 仿 UUID hex 片段
 
@@ -1210,16 +1214,19 @@ if __name__ == "__main__":
         def find_all(self):
             return [_FakeScenario(TEST_ID, "initializing")]
 
+        def find_all_by_tenant(self, tenant_id):
+            return [_FakeScenario(TEST_ID, "initializing")]
+
     _real_sm = scenario_manager
     _real_repo = ScenarioRepository
     globals()["scenario_manager"] = _Stub()
     globals()["ScenarioRepository"] = _StubRepo
     try:
-        sid, err = save_scene(good)
+        sid, err = save_scene(good, None, "test-tenant", [])
         assert sid == "new-id-123" and not err, f"新建失败: {err}"
         assert calls["create"] == 1 and calls["update"] == 0, "首次保存应走 create"
 
-        sid2, err2 = save_scene({**good, "name": "改"}, scenario_id=sid)
+        sid2, err2 = save_scene({**good, "name": "改"}, sid, "test-tenant", [])
         assert sid2 == sid and not err2, f"更新失败: {err2}"
         assert calls["create"] == 1 and calls["update"] == 1, "二次保存应走 update，而非新建"
 
@@ -1227,20 +1234,21 @@ if __name__ == "__main__":
         globals()["ScenarioRepository"] = type("_R2", (), {
             "find_by_scenario_id": lambda self, sid: _FakeScenario(sid, "running"),
             "find_all": lambda self: [],
+            "find_all_by_tenant": lambda self, tid: [],
         })
-        sid3, err3 = save_scene({**good, "name": "改"}, scenario_id=sid)
+        sid3, err3 = save_scene({**good, "name": "改"}, sid, "test-tenant", [])
         assert sid3 is None and "初始化" in err3, f"running 态应拒绝修改: {err3}"
 
         # 恢复 initializing 桩，测试修改意图检测
         globals()["ScenarioRepository"] = _StubRepo
         # 纯查询不触发载入
-        assert _detect_edit(f"总结场景 {TEST_ID} 的对话", None, None) == (None, None), \
+        assert _detect_edit(f"总结场景 {TEST_ID} 的对话", None, None, "test-tenant") == (None, None), \
             "查询不应触发载入"
         # 修改关键词 + id 触发载入（返回解析后的完整 id）
-        assert _detect_edit(f"修改场景 {TEST_ID} 的问题", None, None)[0] == TEST_ID, \
+        assert _detect_edit(f"修改场景 {TEST_ID} 的问题", None, None, "test-tenant")[0] == TEST_ID, \
             "修改应触发载入"
         # 已在编辑同一场景且有草稿：不重复载入（避免丢弃用户改动）
-        assert _detect_edit("把问题改成 2+2", TEST_ID, good) == (None, None), \
+        assert _detect_edit("把问题改成 2+2", TEST_ID, good, "test-tenant") == (None, None), \
             "同场景续改不应重载"
     finally:
         globals()["ScenarioRepository"] = _real_repo
@@ -1299,7 +1307,7 @@ if __name__ == "__main__":
     parsed_wf = parse_workflow_spec(wf_sample)
     assert parsed_wf and parsed_wf["name"] == "研究 Workflow", "应从回复中解析出 workflow-spec"
 
-    wf_md = render_workflow_preview(good_wf)
+    wf_md = render_workflow_preview(good_wf, "test-tenant", [])
     assert "✅" in wf_md and "研究员" in wf_md, f"预览应含通过标记: {wf_md}"
 
     print("workflow self-check OK")

@@ -13,28 +13,38 @@ class AssistantMessageRepository(BaseRepository[AssistantMessage]):
     def __init__(self):
         super().__init__(AssistantMessage)
 
-    def save(self, role: str, content: str, session_id: str = "default") -> int:
+    def save(self, role: str, content: str, session_id: str = "default",
+             tenant_id: str = None) -> int:
         """保存一条消息"""
         message = AssistantMessage(
             role=role,
             content=content,
             session_id=session_id,
-            timestamp=datetime.now()
+            timestamp=datetime.now(),
+            tenant_id=tenant_id,
         )
         return self.create(message)
 
     def find_by_session(self, session_id: str = "default",
-                        limit: int = 100) -> List[AssistantMessage]:
+                        limit: int = 100,
+                        tenant_id: str = None) -> List[AssistantMessage]:
         """获取指定会话的消息历史"""
         with get_connection_manager().get_connection() as conn:
             cursor = conn.cursor()
             sql = f"""
                 SELECT * FROM {self.table_name}
                 WHERE session_id = {self.placeholder}
-                ORDER BY timestamp ASC
-                LIMIT {self.placeholder}
             """
-            cursor.execute(sql, (session_id, limit))
+            params = [session_id]
+
+            if tenant_id:
+                sql += f" AND (tenant_id = {self.placeholder} OR tenant_id IS NULL)"
+                params.append(tenant_id)
+
+            sql += f" ORDER BY timestamp ASC LIMIT {self.placeholder}"
+            params.append(limit)
+
+            cursor.execute(sql, params)
             rows = cursor.fetchall()
 
             return [self.model_class.from_dict({k: row[k] for k in row.keys()})
@@ -44,12 +54,19 @@ class AssistantMessageRepository(BaseRepository[AssistantMessage]):
         """删除指定消息 - 使用基类的 delete 方法"""
         return self.delete(message_id)
 
-    def clear_session(self, session_id: str = "default") -> int:
+    def clear_session(self, session_id: str = "default",
+                      tenant_id: str = None) -> int:
         """清空指定会话的所有消息"""
         with get_connection_manager().get_connection() as conn:
             cursor = conn.cursor()
             sql = f"DELETE FROM {self.table_name} WHERE session_id = {self.placeholder}"
-            cursor.execute(sql, (session_id,))
+            params = [session_id]
+
+            if tenant_id:
+                sql += f" AND (tenant_id = {self.placeholder} OR tenant_id IS NULL)"
+                params.append(tenant_id)
+
+            cursor.execute(sql, params)
             conn.commit()
             return cursor.rowcount
 
@@ -63,34 +80,50 @@ class AssistantMessageRepository(BaseRepository[AssistantMessage]):
                 )
                 conn.commit()
             except Exception as e:
-                # SQLite raises "duplicate column name" if column already exists
                 if "duplicate column" not in str(e).lower():
                     raise
 
-    def count_messages(self, session_id: str = "default") -> int:
+    def count_messages(self, session_id: str = "default",
+                       tenant_id: str = None) -> int:
         """Count non-summary messages in session."""
         with get_connection_manager().get_connection() as conn:
             cursor = conn.cursor()
             sql = (f"SELECT COUNT(*) as cnt FROM {self.table_name} "
                    f"WHERE session_id = {self.placeholder} AND role != 'summary'")
-            cursor.execute(sql, (session_id,))
+            params = [session_id]
+
+            if tenant_id:
+                sql += f" AND (tenant_id = {self.placeholder} OR tenant_id IS NULL)"
+                params.append(tenant_id)
+
+            cursor.execute(sql, params)
             row = cursor.fetchone()
             return row["cnt"] if row else 0
 
     def find_old_messages(self, session_id: str = "default",
-                          limit: int = 30) -> List[AssistantMessage]:
+                          limit: int = 30,
+                          tenant_id: str = None) -> List[AssistantMessage]:
         """Get oldest non-summary messages for compression."""
         with get_connection_manager().get_connection() as conn:
             cursor = conn.cursor()
             sql = (f"SELECT * FROM {self.table_name} "
-                   f"WHERE session_id = {self.placeholder} AND role != 'summary' "
-                   f"ORDER BY timestamp ASC LIMIT {self.placeholder}")
-            cursor.execute(sql, (session_id, limit))
+                   f"WHERE session_id = {self.placeholder} AND role != 'summary'")
+            params = [session_id]
+
+            if tenant_id:
+                sql += f" AND (tenant_id = {self.placeholder} OR tenant_id IS NULL)"
+                params.append(tenant_id)
+
+            sql += f" ORDER BY timestamp ASC LIMIT {self.placeholder}"
+            params.append(limit)
+
+            cursor.execute(sql, params)
             rows = cursor.fetchall()
             return [self.model_class.from_dict({k: row[k] for k in row.keys()})
                     for row in rows]
 
-    def delete_messages_by_ids(self, ids: List[int]) -> int:
+    def delete_messages_by_ids(self, ids: List[int],
+                               tenant_id: str = None) -> int:
         """Delete messages by ID list. Returns count deleted."""
         if not ids:
             return 0
@@ -98,24 +131,38 @@ class AssistantMessageRepository(BaseRepository[AssistantMessage]):
         with get_connection_manager().get_connection() as conn:
             cursor = conn.cursor()
             sql = f"DELETE FROM {self.table_name} WHERE id IN ({placeholders})"
-            cursor.execute(sql, ids)
+            params = list(ids)
+
+            if tenant_id:
+                sql += f" AND (tenant_id = {self.placeholder} OR tenant_id IS NULL)"
+                params.append(tenant_id)
+
+            cursor.execute(sql, params)
             conn.commit()
             return cursor.rowcount
 
-    def find_latest_summary(self, session_id: str = "default") -> Optional[AssistantMessage]:
+    def find_latest_summary(self, session_id: str = "default",
+                            tenant_id: str = None) -> Optional[AssistantMessage]:
         """Get most recent summary message, if any."""
         with get_connection_manager().get_connection() as conn:
             cursor = conn.cursor()
             sql = (f"SELECT * FROM {self.table_name} "
-                   f"WHERE session_id = {self.placeholder} AND role = 'summary' "
-                   f"ORDER BY timestamp DESC LIMIT 1")
-            cursor.execute(sql, (session_id,))
+                   f"WHERE session_id = {self.placeholder} AND role = 'summary'")
+            params = [session_id]
+
+            if tenant_id:
+                sql += f" AND (tenant_id = {self.placeholder} OR tenant_id IS NULL)"
+                params.append(tenant_id)
+
+            sql += f" ORDER BY timestamp DESC LIMIT 1"
+
+            cursor.execute(sql, params)
             row = cursor.fetchone()
             if not row:
                 return None
             return self.model_class.from_dict({k: row[k] for k in row.keys()})
 
-    def delete_pair(self, msg_id: int) -> int:
+    def delete_pair(self, msg_id: int, tenant_id: str = None) -> int:
         """Delete a message and its paired counterpart.
 
         - If msg_id is a user message: delete it + the next assistant message.
@@ -126,13 +173,15 @@ class AssistantMessageRepository(BaseRepository[AssistantMessage]):
         if not target:
             return 0
 
+        if tenant_id and getattr(target, 'tenant_id', None) and target.tenant_id != tenant_id:
+            logger.warning(f"delete_pair: tenant mismatch for message {msg_id}")
+            return 0
+
         ids_to_delete = [msg_id]
 
         with get_connection_manager().get_connection() as conn:
             cursor = conn.cursor()
             if target.role == "user":
-                # Find next assistant message after this user message
-                # (use id, which is strictly monotonic — timestamp may collide in tight loops)
                 sql = (f"SELECT id FROM {self.table_name} "
                        f"WHERE session_id = {self.placeholder} AND role = 'assistant' "
                        f"AND id > {self.placeholder} "
@@ -142,7 +191,6 @@ class AssistantMessageRepository(BaseRepository[AssistantMessage]):
                 if row:
                     ids_to_delete.append(row["id"])
             elif target.role == "assistant":
-                # Find preceding user message
                 sql = (f"SELECT id FROM {self.table_name} "
                        f"WHERE session_id = {self.placeholder} AND role = 'user' "
                        f"AND id < {self.placeholder} "
@@ -154,6 +202,12 @@ class AssistantMessageRepository(BaseRepository[AssistantMessage]):
 
             placeholders = ", ".join([self.placeholder] * len(ids_to_delete))
             sql = f"DELETE FROM {self.table_name} WHERE id IN ({placeholders})"
-            cursor.execute(sql, ids_to_delete)
+            params = list(ids_to_delete)
+
+            if tenant_id:
+                sql += f" AND (tenant_id = {self.placeholder} OR tenant_id IS NULL)"
+                params.append(tenant_id)
+
+            cursor.execute(sql, params)
             conn.commit()
             return cursor.rowcount

@@ -58,8 +58,10 @@ Three peers collaborate over WebSocket/HTTP:
 │  │ ws_server REST     │           │                      │            │
 │  └────────────────────┘           │                      │            │
 │                                    │                      │            │
-│  ┌──────────────────┐  Local DB: events, messages,       │            │
-│  │Flask Internal API│  human_tasks tables (SQLite)       │            │
+│  ┌──────────────────┐  Local DB: 8 tenant-scoped tables   │            │
+│  │Flask Internal API│  (events, messages, human_tasks,    │            │
+│  │ :5000 (Swagger)  │   agents, scenarios, tasks,         │            │
+│  │                  │   assistant_messages, users)        │            │
 │  │ :5000 (Swagger)  │                                    │            │
 │  └──────────────────┘                                    │            │
 └────────────────────────────────────┼──────────────────────┼──────────┘
@@ -111,18 +113,30 @@ SchedulingAgent → associates execution role with server_id=human-1
 
 ### Scene Assistant Chatbot
 
+The **ws_server** side uses direct context injection (server lists, scene/workflow indexes embedded in system prompt).
+The **platform** side uses a ReAct tool-calling loop — the LLM calls tools to fetch live data instead of relying on stale prompt injection.
+
 ```
-User → Gradio chatbot floating window
-  → api_client.chat(message) → POST /api/chat → ws_server
-  → SceneAssistant (LLM-driven multi-turn dialogue)
-  → generates scene-spec draft → user confirms
+User → Gradio chatbot floating window (platform)
+  → SceneAssistant._react_loop(messages, tools)
+  → LLM calls tools before answering:
+    - list_execution_servers → query local DB (synced via /subscribe)
+    - list_human_servers     → query local DB
+    - list_scenarios         → query local DB
+  → LLM generates scene-spec draft → user confirms
   → api_client.chat_save(spec) → POST /api/chat/save → ws_server
   → scenario_manager.create_scenario() → DB write
 
-Also supports workflow management via natural language:
-  → gather workflow index / summarize existing workflows
-  → parse workflow-spec code blocks → validate DAG → render preview
-  → save/load workflows via chat conversation
+ws_server chat endpoint (POST /api/chat):
+  → system prompt injects tenant-scoped context:
+    - gather_scene_index(tenant_id)
+    - gather_workflow_index(tenant_id)
+    - gather_execution_servers(tenant_id)
+    - gather_human_servers(tenant_id)
+  → _maybe_focus / _maybe_workflow_focus inject specific scenario/workflow details
+  → also supports workflow management via natural language:
+    - parse workflow-spec code blocks → validate DAG → render preview
+    - save/load workflows via chat conversation
 ```
 
 ### Workflow System (DAG Pipelines)
@@ -152,7 +166,7 @@ Execute: POST /api/workflows/{id}/execute with input_params
 - **Ack-on-receipt**: agents ACK immediately on receiving a TASK frame. Crash before ACK → re-send on next heartbeat.
 - **Same protocol for all agents**: execution-agent servers and human-agent clients use identical WS frames. Routing is by `server_id`.
 - **Event-driven sync**: WSEventSubscriber listens on `/subscribe`, stores all events in local events/messages/human_tasks tables. Dashboard, Event Log, and Flask API read from these tables.
-- **Multi-tenant isolation**: all data (12 tables + WS broadcasts) scoped by `tenant_id`, enforced at REST, WS, and DB layers.
+- **Multi-tenant isolation**: all data (ws_server 12 tables + platform 8 local tables + WS broadcasts) scoped by `tenant_id`, enforced at REST, WS, and DB layers. Platform derives tenant context from its `WS_SERVER_API_KEY` JWT at startup.
 - **Workflow reuse**: completed scenarios can be published as parameterized DAG workflows and re-executed with new inputs.
 
 ## API Key Authentication
@@ -259,9 +273,18 @@ async def broadcast_event(event):
 
 **Server registration** — `ConnectedServer` stores `tenant_id`; upsert and dispatch validate server ownership per tenant.
 
+### Platform-Side Tenant Isolation
+
+The platform is **single-tenant per deployment**: each instance holds one JWT (`WS_SERVER_API_KEY`) and extracts its `tenantId` at startup via `core/local_tenant.py`. All 8 local tables (events, messages, human_tasks, agents, scenarios, tasks, assistant_messages, users) include a `tenant_id` column.
+
+- `database/__init__.py::_migrate_tenant_id()` — auto-runs at startup: ALTER TABLE + index creation + backfill NULL rows with the current tenant
+- `BaseRepository` — auto-injects `tenant_id` on `create()`, appends tenant filter on all `find_*` / `count` / `delete` queries (compat mode: includes NULL rows so pre-migration data stays visible)
+- `HumanAgentClient` — derives `server_id` from tenant_id (`human-{tenant_id}`) if not explicitly configured
+- `WSEventSubscriber` — stores incoming events with tenant_id from the WS broadcast payload
+
 ### Migration
 
-`database/migration_tenant.py` provides:
+`database/migration_tenant.py` (ws_server) provides:
 - `migrate_add_tenant_id()` — ALTER TABLE + index creation for all 12 tables
 - `migrate_set_default_tenant(default_tenant_id)` — one-time backfill of NULL rows
 

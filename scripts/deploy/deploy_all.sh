@@ -81,6 +81,13 @@ echo "部署 Agent Server Platform 到 $SSH_HOST"
 echo "=========================================="
 
 # [1/6] 组装构建上下文（源码 + Dockerfile）
+# 从本地 .env 读取 WS_SERVER_API_KEY（若存在）
+ASP_ENV_FILE="$REPO_ROOT/src/agent_server_platform/.env"
+WS_API_KEY=""
+if [[ -f "$ASP_ENV_FILE" ]]; then
+  WS_API_KEY=$(grep '^WS_SERVER_API_KEY=' "$ASP_ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
+fi
+
 echo "[1/6] 组装构建上下文..."
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE" "$SEED_ENV_LOCAL" "$TAR" "$REMOTE_SH"' EXIT
@@ -111,11 +118,11 @@ else
   echo "    (credentials.env 缺少 LLM 变量；若远程无运行容器，首次部署将失败)"
 fi
 
-# 写远程部署脚本（引号 heredoc，不做本地展开；配置通过参数 $1..$4 传入）
+# 写远程部署脚本（引号 heredoc，不做本地展开；配置通过参数 $1..$5 传入）
 cat > "$REMOTE_SH" <<'REMOTE_SH'
 #!/bin/bash
 set -euo pipefail
-CONTAINER="$1"; IMAGE="$2"; ROLLBACK="$3"; BUILD_DIR="$4"
+CONTAINER="$1"; IMAGE="$2"; ROLLBACK="$3"; BUILD_DIR="$4"; WS_API_KEY="${5:-}"
 ENV_FILE="/tmp/asp_container.env"
 SEED_ENV="/tmp/asp_seed.env"
 TAR="/tmp/agent-server-platform.tar.gz"
@@ -161,6 +168,7 @@ sudo docker run -d \
   -e WS_SERVER_API_URL=https://agent-socket-server.bdzz.com.cn:8765 \
   -e WS_SERVER_WS_URL=wss://agent-socket-server.bdzz.com.cn:8765 \
   -e SANDBOX_BACKEND_WS_URL=wss://agent-socket-server.bdzz.com.cn:8765 \
+  ${WS_API_KEY:+-e WS_SERVER_API_KEY="$WS_API_KEY"} \
   "$IMAGE" >/dev/null
 
 echo "[7/8] 等待并校验"
@@ -190,7 +198,7 @@ fi
 
 # [5/6] 远程执行（配置通过参数传入，避免命令行出现密钥）
 echo "[5/6] 远程执行部署..."
-ssh_pw "bash $REMOTE_SH '$CONTAINER_NAME' '$IMAGE_NAME' '$ROLLBACK_IMAGE' '$REMOTE_BUILD_DIR'"
+ssh_pw "bash $REMOTE_SH '$CONTAINER_NAME' '$IMAGE_NAME' '$ROLLBACK_IMAGE' '$REMOTE_BUILD_DIR' '$WS_API_KEY'"
 
 # [6/6] 健康检查
 echo "[6/6] 健康检查..."

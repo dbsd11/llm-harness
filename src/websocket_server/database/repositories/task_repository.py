@@ -229,21 +229,28 @@ class TaskRepository(BaseRepository[Task]):
         return self.count(
             {"scenario_id": scenario_id, "state": "pending_review"})
 
-    def find_dependents_by_task_id(self, task_id: str) -> List[Task]:
+    def find_dependents_by_task_id(self, task_id: str,
+                                   tenant_id: str = None) -> List[Task]:
         """Reverse-dependency lookup: tasks whose depends_on JSON array contains
         task_id. Used for sub-tree re-derivation (manual_acceptance)."""
         if not task_id:
             return []
         from database.connection import get_connection_manager
-        # depends_on is a JSON array string like ["id1","id2"]; match the quoted id.
         pattern = f'%"{task_id}"%'
+        ph = self.placeholder
         sql = (f"SELECT * FROM {self.table_name} "
-               f"WHERE depends_on LIKE {self.placeholder}")
+               f"WHERE depends_on LIKE {ph}")
+        params = [pattern]
+
+        if tenant_id:
+            sql += f" AND (tenant_id = {ph} OR tenant_id IS NULL)"
+            params.append(tenant_id)
+
         try:
             conn_mgr = get_connection_manager()
             with conn_mgr.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute(sql, (pattern,))
+                cursor.execute(sql, params)
                 rows = cursor.fetchall()
                 return [self.model_class.from_dict({k: row[k] for k in row.keys()})
                         for row in rows]

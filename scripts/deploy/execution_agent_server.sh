@@ -68,6 +68,14 @@ SERVER_NAME="${SERVER_NAME:-ExecutionServer1}"
 MAX_QUOTA="${MAX_QUOTA:-4}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-5}"
 
+# WS_SERVER_API_KEY: read from agent_server_platform .env if not set explicitly
+if [[ -z "${WS_SERVER_API_KEY:-}" ]]; then
+  _ASP_ENV="$REPO_ROOT/src/agent_server_platform/.env"
+  if [[ -f "$_ASP_ENV" ]]; then
+    WS_SERVER_API_KEY=$(grep '^WS_SERVER_API_KEY=' "$_ASP_ENV" 2>/dev/null | head -1 | cut -d= -f2-)
+  fi
+fi
+
 # LLM config (first deploy; otherwise preserved via --env-file)
 LLM_BASE_URL="${LLM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
 LLM_MODEL="${LLM_MODEL:-qwen-plus}"
@@ -133,9 +141,9 @@ echo "==> [5/6] Run container (env preserved, BACKEND_WS_URL=$BACKEND_WS_URL)"
 # Reuse path: --env-file preserves the old container's secrets; -e overrides the URL.
 # First-deploy path: explicit -e (requires DASHSCOPE_API_KEY in local env).
 if [[ -n "$DASHSCOPE_API_KEY" ]]; then
-  ssh_pw "sudo mkdir -p /agent-data-files/$SERVER_ID && sudo docker run -d --name $CONTAINER --network host -v /agent-data-files/$SERVER_ID:/data -e SERVER_ID=$SERVER_ID -e SERVER_NAME=\\\"$SERVER_NAME\\\" -e MAX_QUOTA=$MAX_QUOTA -e HEARTBEAT_INTERVAL=$HEARTBEAT_INTERVAL -e BACKEND_WS_URL=$BACKEND_WS_URL -e DASHSCOPE_API_KEY=$DASHSCOPE_API_KEY -e LLM_BASE_URL=$LLM_BASE_URL -e LLM_MODEL=$LLM_MODEL -e LLM_MAX_TOKENS=$LLM_MAX_TOKENS -e LLM_ENABLE_THINKING=$LLM_ENABLE_THINKING -e LLM_TIMEOUT=$LLM_TIMEOUT -e EVENT_PERSIST_DISABLED=1 $IMAGE && sleep 3 && sudo docker ps --filter name=$CONTAINER && echo '--- logs ---' && sudo docker logs $CONTAINER --tail 15"
+  ssh_pw "sudo mkdir -p /agent-data-files/$SERVER_ID && sudo docker run -d --name $CONTAINER --network host -v /agent-data-files/$SERVER_ID:/data -e SERVER_ID=$SERVER_ID -e SERVER_NAME=\\\"$SERVER_NAME\\\" -e MAX_QUOTA=$MAX_QUOTA -e HEARTBEAT_INTERVAL=$HEARTBEAT_INTERVAL -e BACKEND_WS_URL=$BACKEND_WS_URL -e DASHSCOPE_API_KEY=$DASHSCOPE_API_KEY -e WS_SERVER_API_KEY=$WS_SERVER_API_KEY -e LLM_BASE_URL=$LLM_BASE_URL -e LLM_MODEL=$LLM_MODEL -e LLM_MAX_TOKENS=$LLM_MAX_TOKENS -e LLM_ENABLE_THINKING=$LLM_ENABLE_THINKING -e LLM_TIMEOUT=$LLM_TIMEOUT -e EVENT_PERSIST_DISABLED=1 $IMAGE && sleep 3 && sudo docker ps --filter name=$CONTAINER && echo '--- logs ---' && sudo docker logs $CONTAINER --tail 15"
 else
-  ssh_pw "if test -f $ENV_FILE; then SERVER_ID_VAL=\$(grep ^SERVER_ID= $ENV_FILE | cut -d= -f2- | tr -d '\\\"'); sudo mkdir -p /agent-data-files/\$SERVER_ID_VAL && sudo docker run -d --name $CONTAINER --network host -v /agent-data-files/\$SERVER_ID_VAL:/data --env-file $ENV_FILE -e BACKEND_WS_URL=$BACKEND_WS_URL $IMAGE; else echo 'ERROR: no env-file (no prior container) and no DASHSCOPE_API_KEY in local env; set DASHSCOPE_API_KEY for first deploy'; exit 1; fi && sleep 3 && sudo docker ps --filter name=$CONTAINER && echo '--- logs ---' && sudo docker logs $CONTAINER --tail 15"
+  ssh_pw "if test -f $ENV_FILE; then SERVER_ID_VAL=\$(grep ^SERVER_ID= $ENV_FILE | cut -d= -f2- | tr -d '\\\"'); sudo mkdir -p /agent-data-files/\$SERVER_ID_VAL && sudo docker run -d --name $CONTAINER --network host -v /agent-data-files/\$SERVER_ID_VAL:/data --env-file $ENV_FILE -e BACKEND_WS_URL=$BACKEND_WS_URL -e WS_SERVER_API_KEY=$WS_SERVER_API_KEY $IMAGE; else echo 'ERROR: no env-file (no prior container) and no DASHSCOPE_API_KEY in local env; set DASHSCOPE_API_KEY for first deploy'; exit 1; fi && sleep 3 && sudo docker ps --filter name=$CONTAINER && echo '--- logs ---' && sudo docker logs $CONTAINER --tail 15"
 fi
 
 echo "==> Done: $CONTAINER -> $BACKEND_WS_URL  (rollback: $ROLLBACK_IMAGE)"

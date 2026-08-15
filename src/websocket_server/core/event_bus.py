@@ -32,7 +32,8 @@ class EventBus:
         self.worker_thread.start()
 
     def emit(self, event_type: str, data: Dict[str, Any],
-             trace_id: str = None, metadata: Dict[str, Any] = None) -> str:
+             trace_id: str = None, metadata: Dict[str, Any] = None,
+             tenant_id: str = None) -> str:
         """
         Emit event to bus with optional trace context (埋点).
 
@@ -41,12 +42,16 @@ class EventBus:
             data: Event data as dict
             trace_id: Trace ID to link related events (auto-generated if None)
             metadata: Extra context as dict
+            tenant_id: Tenant ID for isolation (injected into data for WS broadcast filtering)
 
         Returns:
             The trace_id for this event
         """
         if not trace_id:
             trace_id = str(uuid.uuid4())
+
+        if tenant_id and isinstance(data, dict):
+            data.setdefault("tenant_id", tenant_id)
 
         event = {
             "event_type": event_type,
@@ -66,6 +71,7 @@ class EventBus:
                     json.dumps(data, ensure_ascii=False),
                     trace_id=trace_id,
                     metadata=json.dumps(metadata or {}, ensure_ascii=False),
+                    tenant_id=tenant_id,
                 )
             except Exception as e:
                 logger.error(f"Failed to persist event: {e}")

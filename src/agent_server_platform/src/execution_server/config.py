@@ -9,7 +9,11 @@ def load_config() -> dict:
     Includes both server connection params and LLM configuration.
     """
     load_dotenv()
-    server_id = os.getenv("SERVER_ID", "node-1")
+    server_id = os.getenv("SERVER_ID", "")
+    if not server_id:
+        from core.local_tenant import get_tenant_id
+        tid = get_tenant_id()
+        server_id = f"exec-{tid}" if tid else "node-1"
     return {
         # Server identity and registration
         "server_id": server_id,

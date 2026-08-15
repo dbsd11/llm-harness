@@ -55,7 +55,8 @@ class ExecutionAgent(BaseAgent):
         Returns:
             Execution result with LLM response
         """
-        event_bus.emit("task.execution_started", {"task_id": task_id})
+        event_bus.emit("task.execution_started", {"task_id": task_id},
+                       tenant_id=context.get("tenant_id"))
 
         try:
             # Extract question/goal from context
@@ -88,7 +89,7 @@ class ExecutionAgent(BaseAgent):
                 "role": self.role,
                 "question_length": len(question),
                 "response_length": len(response),
-            })
+            }, tenant_id=context.get("tenant_id"))
 
             return {
                 "success": True,
@@ -105,7 +106,7 @@ class ExecutionAgent(BaseAgent):
             event_bus.emit("task.execution_failed", {
                 "task_id": task_id,
                 "error": error_msg,
-            })
+            }, tenant_id=context.get("tenant_id"))
 
             return {
                 "success": False,

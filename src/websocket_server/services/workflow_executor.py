@@ -70,7 +70,7 @@ class WorkflowExecutor:
             "scenario_id": scenario_id,
             "workflow_id": workflow_id,
             "step_count": len(templates),
-        })
+        }, tenant_id=getattr(workflow, 'tenant_id', None))
 
         return {
             "scenario_id": scenario_id,
@@ -85,7 +85,8 @@ class WorkflowExecutor:
         parent_task_id = None
         try:
             step_id_to_task_id, parent_task_id = self._materialize_tasks(
-                scenario_id, workflow.workflow_id, templates, input_params)
+                scenario_id, workflow.workflow_id, templates, input_params,
+                getattr(workflow, 'tenant_id', None))
 
             waves = self._build_waves(templates)
             replies_by_task_id: Dict[str, dict] = {}
@@ -104,6 +105,7 @@ class WorkflowExecutor:
                         "question": goal,
                         "is_workflow_task": True,
                         "scenario_id": scenario_id,
+                        "tenant_id": getattr(workflow, 'tenant_id', None),
                     }
 
                     if tmpl.server_id:
@@ -140,7 +142,8 @@ class WorkflowExecutor:
                 if failed_in_wave and wave_idx < len(waves) - 1:
                     self._propagate_failure(
                         failed_in_wave, waves, step_id_to_task_id,
-                        wave_idx + 1, scenario_id)
+                        wave_idx + 1, scenario_id,
+                        tenant_id=getattr(workflow, 'tenant_id', None))
 
             if failed_count > 0:
                 if parent_task_id:
@@ -151,7 +154,7 @@ class WorkflowExecutor:
                     "scenario_id": scenario_id,
                     "workflow_id": workflow.workflow_id,
                     "failed_steps": failed_count,
-                })
+                }, tenant_id=getattr(workflow, 'tenant_id', None))
             else:
                 if parent_task_id:
                     self.task_repo.mark_as_completed(parent_task_id)
@@ -160,7 +163,7 @@ class WorkflowExecutor:
                     "scenario_id": scenario_id,
                     "workflow_id": workflow.workflow_id,
                     "completed_steps": completed_count,
-                })
+                }, tenant_id=getattr(workflow, 'tenant_id', None))
 
             logger.info(f"Workflow execution scenario {scenario_id} finished: "
                         f"{completed_count} completed, {failed_count} failed")
@@ -174,7 +177,7 @@ class WorkflowExecutor:
                 "scenario_id": scenario_id,
                 "workflow_id": workflow.workflow_id,
                 "error": str(e),
-            })
+            }, tenant_id=getattr(workflow, 'tenant_id', None))
 
     def _validate_inputs(self, workflow: Workflow, params: Dict) -> Tuple[bool, str]:
         try:
@@ -261,6 +264,7 @@ class WorkflowExecutor:
             config=json.dumps(scenario_config, ensure_ascii=False),
             context=json.dumps({"trace_id": scenario_id}, ensure_ascii=False),
             created_by=created_by,
+            tenant_id=getattr(workflow, 'tenant_id', None),
             created_at=now,
             updated_at=now,
             started_at=now,
@@ -270,7 +274,8 @@ class WorkflowExecutor:
 
     def _materialize_tasks(self, scenario_id: str, workflow_id: str,
                            templates: List[WorkflowTaskTemplate],
-                           input_params: Dict[str, Any]) -> Tuple[Dict[str, str], str]:
+                           input_params: Dict[str, Any],
+                           tenant_id: str = None) -> Tuple[Dict[str, str], str]:
         parent_task_id = str(uuid.uuid4())
         now = datetime.now()
         parent_task = Task(
@@ -280,6 +285,7 @@ class WorkflowExecutor:
             state="running",
             priority=0,
             timeout_seconds=3600,
+            tenant_id=tenant_id,
             context=json.dumps({
                 "workflow_id": workflow_id,
                 "is_workflow_task": True,
@@ -321,6 +327,7 @@ class WorkflowExecutor:
                 state="pending",
                 priority=0,
                 timeout_seconds=tmpl.timeout_seconds or 300,
+                tenant_id=tenant_id,
                 context=json.dumps(ctx, ensure_ascii=False),
                 agent_role=tmpl.agent_role,
                 created_at=now,
@@ -407,7 +414,8 @@ class WorkflowExecutor:
     def _propagate_failure(self, failed_task_ids: List[str],
                            waves: List[List[WorkflowTaskTemplate]],
                            step_id_to_task_id: Dict[str, str],
-                           start_wave: int, scenario_id: str) -> None:
+                           start_wave: int, scenario_id: str,
+                           tenant_id: str = None) -> None:
         failed_set = set(failed_task_ids)
         step_to_task = step_id_to_task_id
 
@@ -423,7 +431,7 @@ class WorkflowExecutor:
                             logger.error(f"Failed to mark skipped task {tid}: {e}")
                         event_bus.emit("task.skipped", {
                             "task_id": tid, "reason": "predecessor failed",
-                        })
+                        }, tenant_id=tenant_id)
 
 
 workflow_executor = WorkflowExecutor()

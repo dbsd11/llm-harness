@@ -7,9 +7,12 @@ from database.repositories.task_repository import TaskRepository
 from logger import logger
 
 
-def list_execution_servers() -> dict:
+def list_execution_servers(tenant_id: str) -> dict:
     """
-    Tool: List all registered execution agent servers.
+    Tool: List all registered execution agent servers for the current tenant.
+
+    Args:
+        tenant_id: Tenant ID for isolation (injected by scheduling agent)
 
     Returns:
         {
@@ -29,7 +32,7 @@ def list_execution_servers() -> dict:
         }
     """
     repo = ExecutionServerRepository()
-    servers = repo.list_all()
+    servers = repo.find_all_by_tenant(tenant_id)
 
     result = {
         "servers": [
@@ -148,12 +151,13 @@ def destroy_execution_server_sandbox(server_id: str) -> dict:
         }
 
 
-def get_task_details(task_id: str) -> dict:
+def get_task_details(task_id: str, tenant_id: str) -> dict:
     """
     Tool: Get detailed information about a specific task.
 
     Args:
         task_id: Task UUID
+        tenant_id: Tenant ID for isolation (injected by scheduling agent)
 
     Returns:
         Task details including goal, state, result, context, depends_on
@@ -161,6 +165,8 @@ def get_task_details(task_id: str) -> dict:
     repo = TaskRepository()
     task = repo.find_by_task_id(task_id)
     if not task:
+        return {"success": False, "error": f"Task not found: {task_id}"}
+    if getattr(task, 'tenant_id', None) and task.tenant_id != tenant_id:
         return {"success": False, "error": f"Task not found: {task_id}"}
 
     return {
@@ -183,18 +189,19 @@ def get_task_details(task_id: str) -> dict:
     }
 
 
-def list_tasks_by_scenario(scenario_id: str) -> dict:
+def list_tasks_by_scenario(scenario_id: str, tenant_id: str) -> dict:
     """
     Tool: List all tasks in a scenario.
 
     Args:
         scenario_id: Scenario ID
+        tenant_id: Tenant ID for isolation (injected by scheduling agent)
 
     Returns:
         List of tasks with id, goal, state, depends_on
     """
     repo = TaskRepository()
-    tasks = repo.find_by_scenario_id(scenario_id)
+    tasks = repo.find_by_scenario_id(scenario_id, tenant_id=tenant_id)
 
     return {
         "success": True,
@@ -213,18 +220,19 @@ def list_tasks_by_scenario(scenario_id: str) -> dict:
     }
 
 
-def list_tasks_by_state(state: str) -> dict:
+def list_tasks_by_state(state: str, tenant_id: str) -> dict:
     """
     Tool: List all tasks in a specific state.
 
     Args:
         state: Task state (pending, running, success, failed, etc.)
+        tenant_id: Tenant ID for isolation (injected by scheduling agent)
 
     Returns:
         List of tasks in the given state
     """
     repo = TaskRepository()
-    tasks = repo.find_by_state(state)
+    tasks = repo.find_by_state(state, tenant_id=tenant_id)
 
     return {
         "success": True,
@@ -242,12 +250,13 @@ def list_tasks_by_state(state: str) -> dict:
     }
 
 
-def get_server_details(server_id: str) -> dict:
+def get_server_details(server_id: str, tenant_id: str) -> dict:
     """
     Tool: Get detailed information about a specific execution server.
 
     Args:
         server_id: Server identifier
+        tenant_id: Tenant ID for isolation (injected by scheduling agent)
 
     Returns:
         Server details including status, quota, env_info
@@ -255,6 +264,8 @@ def get_server_details(server_id: str) -> dict:
     repo = ExecutionServerRepository()
     server = repo.find_by_server_id(server_id)
     if not server:
+        return {"success": False, "error": f"Server not found: {server_id}"}
+    if getattr(server, 'tenant_id', None) and server.tenant_id != tenant_id:
         return {"success": False, "error": f"Server not found: {server_id}"}
 
     return {

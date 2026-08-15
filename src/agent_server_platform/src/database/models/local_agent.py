@@ -19,6 +19,7 @@ class Agent(BaseModel):
         "status": str,  # 'active', 'inactive', 'error'
         "created_at": datetime,
         "updated_at": datetime,
+        "tenant_id": str,
     }
     __default_order__ = "id DESC"
 

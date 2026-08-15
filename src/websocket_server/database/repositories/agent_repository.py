@@ -46,9 +46,12 @@ class AgentRepository(BaseRepository[Agent]):
             return self._tenant_query(criteria, tenant_id)
         return self.find_by_criteria(criteria)
 
-    def find_by_status(self, status: str) -> List[Agent]:
-        """Find agents by status"""
-        return self.find_by_criteria({"status": status})
+    def find_by_status(self, status: str, tenant_id: str = None) -> List[Agent]:
+        """Find agents by status (tenant-scoped)"""
+        criteria = {"status": status}
+        if tenant_id:
+            return self._tenant_query(criteria, tenant_id)
+        return self.find_by_criteria(criteria)
 
     def find_by_scenario_id(self, scenario_id: str) -> List[Agent]:
         """Find agents registered for a scenario"""
@@ -56,7 +59,8 @@ class AgentRepository(BaseRepository[Agent]):
             return []
         return self.find_by_criteria({"scenario_id": scenario_id})
 
-    def delete_by_scenario_id(self, scenario_id: str) -> int:
+    def delete_by_scenario_id(self, scenario_id: str,
+                              tenant_id: str = None) -> int:
         """Delete all agents registered for a scenario. Returns count deleted."""
         if not scenario_id:
             return 0
@@ -65,10 +69,12 @@ class AgentRepository(BaseRepository[Agent]):
             conn_mgr = get_connection_manager()
             with conn_mgr.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute(
-                    f"DELETE FROM {self.table_name} WHERE scenario_id = {self.placeholder}",
-                    (scenario_id,)
-                )
+                sql = f"DELETE FROM {self.table_name} WHERE scenario_id = {self.placeholder}"
+                params = [scenario_id]
+                if tenant_id:
+                    sql += f" AND (tenant_id = {self.placeholder} OR tenant_id IS NULL)"
+                    params.append(tenant_id)
+                cursor.execute(sql, params)
                 conn.commit()
                 return cursor.rowcount
         except Exception as e:

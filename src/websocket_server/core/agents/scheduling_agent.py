@@ -54,6 +54,8 @@ class SchedulingAgent(BaseAgent):
             Tool result dict
         """
         try:
+            if self.tenant_id:
+                kwargs.setdefault("tenant_id", self.tenant_id)
             result = self.tools.call(tool_name, **kwargs)
             logger.info(f"Tool {tool_name} called successfully")
             return result
@@ -82,6 +84,7 @@ class SchedulingAgent(BaseAgent):
 
         logger.info(f"SchedulingAgent processing goal: {goal}")
 
+        self.tenant_id = context.get("tenant_id")
         manual_acceptance = context.get("manual_acceptance")
         resume_cycle = context.get("resume_cycle", False)
         scenario_id = context.get("scenario_id")
@@ -193,7 +196,8 @@ class SchedulingAgent(BaseAgent):
                                 tid, "Skipped: predecessor task failed")
                             failed_ids.add(tid)
                             event_bus.emit("task.skipped", {
-                                "task_id": tid, "reason": "predecessor failed"})
+                                "task_id": tid, "reason": "predecessor failed"},
+                                tenant_id=self.tenant_id)
                             continue
 
                         ctx = dict(sub.get("context", {}) or {})
@@ -249,7 +253,7 @@ class SchedulingAgent(BaseAgent):
                     "topic_id": topic_id,
                     "subtask_count": len(subtask_ids),
                     "subtask_ids": subtask_ids,
-                })
+                }, tenant_id=self.tenant_id)
 
                 return {
                     "success": True,
@@ -265,7 +269,7 @@ class SchedulingAgent(BaseAgent):
                 "topic_id": topic_id,
                 "subtask_count": len(subtask_ids),
                 "subtask_ids": subtask_ids,
-            })
+            }, tenant_id=self.tenant_id)
 
             return {
                 "success": True,
@@ -281,7 +285,7 @@ class SchedulingAgent(BaseAgent):
             event_bus.emit("task.scheduling_failed", {
                 "task_id": task_id,
                 "error": error_msg,
-            })
+            }, tenant_id=self.tenant_id)
 
             return {
                 "success": False,
@@ -424,7 +428,7 @@ class SchedulingAgent(BaseAgent):
                             logger.error(f"Failed to mark skipped task {tid}: {e}")
                         event_bus.emit("task.skipped", {
                             "task_id": tid, "reason": "predecessor failed",
-                        })
+                        }, tenant_id=self.tenant_id)
                         skipped.add(tid)
         return skipped
 
@@ -554,7 +558,11 @@ class SchedulingAgent(BaseAgent):
         """
         try:
             from database.repositories.execution_server_repository import ExecutionServerRepository
-            servers = ExecutionServerRepository().list_all()
+            repo = ExecutionServerRepository()
+            if not self.tenant_id:
+                logger.warning("_collect_env_info: tenant_id not set, returning empty server list")
+                return []
+            servers = repo.find_all_by_tenant(self.tenant_id)
             result = []
             for s in servers:
                 if not s.connected:
@@ -653,6 +661,8 @@ class SchedulingAgent(BaseAgent):
                     fn_args = {}
 
                 try:
+                    if self.tenant_id:
+                        fn_args.setdefault("tenant_id", self.tenant_id)
                     tool_result = self.tools.call(fn_name, **fn_args)
                     tool_output = json.dumps(tool_result, ensure_ascii=False, default=str)
                 except Exception as e:
@@ -795,6 +805,7 @@ class SchedulingAgent(BaseAgent):
             timeout_seconds=subtask.get("timeout_seconds", 3600),
             max_retries=3,
             retry_count=0,
+            tenant_id=self.tenant_id,
             context=json.dumps(subtask.get("context", {}), ensure_ascii=False),
             created_at=datetime.now(),
             updated_at=datetime.now()
@@ -811,7 +822,7 @@ class SchedulingAgent(BaseAgent):
             "topic_id": topic_id,
             "goal": goal,
             "depends_on": resolved_deps,
-        })
+        }, tenant_id=self.tenant_id)
 
         logger.info(f"Created subtask {task_id} for parent {parent_task_id} "
                     f"(topic: {topic_id}, depends_on: {resolved_deps})")
@@ -841,6 +852,7 @@ class SchedulingAgent(BaseAgent):
             timeout_seconds=context.get("timeout_seconds", 3600) if context else 3600,
             max_retries=3,
             retry_count=0,
+            tenant_id=self.tenant_id,
             context=json.dumps(context, ensure_ascii=False) if context else "{}",
             created_at=datetime.now(),
             updated_at=datetime.now()
@@ -851,7 +863,7 @@ class SchedulingAgent(BaseAgent):
         event_bus.emit("task.created", {
             "task_id": task_id,
             "goal": goal,
-        })
+        }, tenant_id=self.tenant_id)
 
         return task_id
 
@@ -887,7 +899,7 @@ class SchedulingAgent(BaseAgent):
             "task_id": task_id,
             "old_state": old_state,
             "new_state": new_state.value,
-        })
+        }, tenant_id=self.tenant_id)
 
         logger.info(f"Task {task_id} state: {old_state} -> {new_state.value}")
         return True

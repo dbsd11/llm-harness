@@ -42,12 +42,13 @@ class CodeExecutionScenario(BaseScenario):
         """Execute code via mqs dispatch to remote execution server"""
         code_content = self.script or self.code
         scenario_id = self.context.scenario_id
+        _tid = self._config.get("tenant_id")
 
         event_bus.emit("scenario.code_execution_started", {
             "scenario_id": scenario_id,
             "has_code": bool(self.code),
             "has_script": bool(self.script),
-        })
+        }, tenant_id=_tid)
 
         try:
             exec_role = "Python计算专家"
@@ -84,6 +85,7 @@ class CodeExecutionScenario(BaseScenario):
                 timeout_seconds=self.timeout,
                 max_retries=0,
                 retry_count=0,
+                tenant_id=_tid,
                 context=json.dumps(task_context, ensure_ascii=False),
                 created_at=datetime.now(),
                 updated_at=datetime.now(),
@@ -122,7 +124,7 @@ class CodeExecutionScenario(BaseScenario):
                 "scenario_id": scenario_id,
                 "task_id": task_id,
                 "task_state": task_state,
-            })
+            }, tenant_id=_tid)
 
             return {
                 "success": reply.success,
@@ -138,7 +140,7 @@ class CodeExecutionScenario(BaseScenario):
             event_bus.emit("scenario.code_execution_failed", {
                 "scenario_id": scenario_id,
                 "error": error_msg,
-            })
+            }, tenant_id=_tid)
 
             return {
                 "success": False,

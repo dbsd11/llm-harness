@@ -9,9 +9,10 @@ from logger import logger
 # Import assistant functions (lazy — only loaded when chat API is called)
 from services.scene_assistant import (
     reply, render_preview, save_scene, parse_scene_spec,
-    load_scenario_spec, gather_scene_index, SceneAssistant,
+    load_scenario_spec, gather_scene_index,
     parse_workflow_spec, save_workflow, render_workflow_preview,
     load_workflow_spec, gather_workflow_index,
+    _fetch_servers,
 )
 from services.compression import should_compress, build_summary_prompt
 from database.repositories.assistant_message_repository import AssistantMessageRepository
@@ -45,18 +46,22 @@ async def chat(request: web.Request) -> web.Response:
     if not user_text.strip():
         return web.json_response({"success": False, "error": "message is required"}, status=400)
 
+    tenant_id = request.get("tenant_id")
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
+
     try:
         # Save user message (DB I/O off the loop)
         msg_repo = AssistantMessageRepository()
-        await run_in_db_thread(msg_repo.save, "user", user_text, session_id)
+        await run_in_db_thread(msg_repo.save, "user", user_text, session_id, tenant_id)
 
         # Check if compression is needed
-        msg_count = await run_in_db_thread(msg_repo.count_messages, session_id)
+        msg_count = await run_in_db_thread(msg_repo.count_messages, session_id, tenant_id)
         summary_content = None
         if should_compress(msg_count):
             from services.compression import COMPRESS_BATCH
             old_msgs = await run_in_db_thread(
-                lambda: msg_repo.find_old_messages(session_id, limit=COMPRESS_BATCH)
+                lambda: msg_repo.find_old_messages(session_id, limit=COMPRESS_BATCH, tenant_id=tenant_id)
             )
             if old_msgs:
                 summary_prompt = build_summary_prompt(old_msgs)
@@ -66,10 +71,10 @@ async def chat(request: web.Request) -> web.Response:
                     [{"role": "user", "content": summary_prompt}], 0.3,
                 )
                 if llm_summary:
-                    await run_in_db_thread(msg_repo.save, "summary", llm_summary, session_id)
+                    await run_in_db_thread(msg_repo.save, "summary", llm_summary, session_id, tenant_id)
                     ids_to_delete = [m.id for m in old_msgs]
-                    await run_in_db_thread(msg_repo.delete_messages_by_ids, ids_to_delete)
-                    summary_obj = await run_in_db_thread(msg_repo.find_latest_summary, session_id)
+                    await run_in_db_thread(msg_repo.delete_messages_by_ids, ids_to_delete, tenant_id)
+                    summary_obj = await run_in_db_thread(msg_repo.find_latest_summary, session_id, tenant_id)
                     if summary_obj:
                         summary_content = summary_obj.content
 
@@ -77,11 +82,11 @@ async def chat(request: web.Request) -> web.Response:
         visible, new_pending, preview_md, new_saved_id, \
             new_pending_wf, new_saved_wf_id = await run_in_llm_thread(
             reply, user_text, history, pending_scene, saved_id, summary_content,
-            pending_workflow, saved_workflow_id
+            pending_workflow, saved_workflow_id, tenant_id
         )
 
         # Save assistant reply
-        await run_in_db_thread(msg_repo.save, "assistant", visible, session_id)
+        await run_in_db_thread(msg_repo.save, "assistant", visible, session_id, tenant_id)
 
         # Parse scene spec from reply
         spec = parse_scene_spec(visible)
@@ -99,7 +104,7 @@ async def chat(request: web.Request) -> web.Response:
             "pending_workflow": new_pending_wf,
             "workflow_id": new_saved_wf_id,
             "workflow_spec": wf_spec,
-            "workflow_preview": render_workflow_preview(new_pending_wf),
+            "workflow_preview": render_workflow_preview(new_pending_wf, tenant_id),
             "session_id": session_id,
         })
     except Exception as e:
@@ -110,6 +115,8 @@ async def chat(request: web.Request) -> web.Response:
 async def chat_save(request: web.Request) -> web.Response:
     """Persist a scene-spec draft to database (tenant-isolated)."""
     tenant_id = request.get("tenant_id")
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
     try:
         payload = await request.json()
     except Exception:
@@ -123,7 +130,8 @@ async def chat_save(request: web.Request) -> web.Response:
         return web.json_response({"success": False, "error": "scene_spec is required"}, status=400)
 
     try:
-        saved_id, error = await run_in_db_thread(save_scene, spec, scene_id)
+        servers = await run_in_db_thread(_fetch_servers, tenant_id)
+        saved_id, error = await run_in_db_thread(save_scene, spec, scene_id, tenant_id, servers)
         if error:
             return web.json_response({"success": False, "error": error}, status=400)
 
@@ -147,7 +155,7 @@ async def chat_save(request: web.Request) -> web.Response:
         action = "更新" if scene_id else "创建"
         await run_in_db_thread(
             msg_repo.save, "assistant",
-            f"✅ 场景已{action}保存（ID: {saved_id[:8]}...）", session_id,
+            f"✅ 场景已{action}保存（ID: {saved_id[:8]}...）", session_id, tenant_id,
         )
 
         return web.json_response({
@@ -164,6 +172,9 @@ async def chat_preview(request: web.Request) -> web.Response:
     """Get current scene-spec preview for a session."""
     session_id = request.query.get("session_id", "default")
     spec = request.query.get("spec")
+    tenant_id = request.get("tenant_id")
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
     if spec:
         try:
             spec_obj = json.loads(spec)
@@ -172,7 +183,8 @@ async def chat_preview(request: web.Request) -> web.Response:
     else:
         spec_obj = None
 
-    preview_md = render_preview(spec_obj)
+    servers = await run_in_db_thread(_fetch_servers, tenant_id)
+    preview_md = render_preview(spec_obj, tenant_id, servers)
     return web.json_response({"success": True, "preview": preview_md})
 
 
@@ -182,31 +194,30 @@ async def chat_load_scene(request: web.Request) -> web.Response:
     tenant_id = request.get("tenant_id")
     if not scene_id:
         return web.json_response({"success": False, "error": "scene_id is required"}, status=400)
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
 
-    spec = await run_in_db_thread(load_scenario_spec, scene_id)
+    spec = await run_in_db_thread(load_scenario_spec, scene_id, tenant_id)
     if not spec:
         return web.json_response({"success": False, "error": "Scene not found"}, status=404)
-
-    # 租户隔离：检查所有权
-    if tenant_id:
-        from database.repositories.scenario_repository import ScenarioRepository
-        repo = ScenarioRepository()
-        scenario = await run_in_db_thread(repo.find_by_scenario_id, scene_id)
-        if scenario and scenario.tenant_id and scenario.tenant_id != tenant_id:
-            return web.json_response({"success": False, "error": "Scene not found"}, status=404)
 
     return web.json_response({"success": True, "scene_spec": spec})
 
 
 async def chat_scene_index(request: web.Request) -> web.Response:
     """Get scene index for the assistant."""
-    index = await run_in_db_thread(gather_scene_index)
+    tenant_id = request.get("tenant_id")
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
+    index = await run_in_db_thread(gather_scene_index, tenant_id)
     return web.json_response({"success": True, "scene_index": index})
 
 
 async def chat_workflow_save(request: web.Request) -> web.Response:
     """Persist a workflow-spec draft to database (tenant-isolated)."""
     tenant_id = request.get("tenant_id")
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
     try:
         payload = await request.json()
     except Exception:
@@ -220,7 +231,8 @@ async def chat_workflow_save(request: web.Request) -> web.Response:
         return web.json_response({"success": False, "error": "workflow_spec is required"}, status=400)
 
     try:
-        saved_id, error = await run_in_db_thread(save_workflow, spec, workflow_id)
+        servers = await run_in_db_thread(_fetch_servers, tenant_id)
+        saved_id, error = await run_in_db_thread(save_workflow, spec, workflow_id, tenant_id, servers)
         if error:
             return web.json_response({"success": False, "error": error}, status=400)
 
@@ -246,7 +258,7 @@ async def chat_workflow_save(request: web.Request) -> web.Response:
         action = "更新" if workflow_id else "创建"
         await run_in_db_thread(
             msg_repo.save, "assistant",
-            f"✅ Workflow 已{action}保存（ID: {saved_id[:8]}...）", session_id,
+            f"✅ Workflow 已{action}保存（ID: {saved_id[:8]}...）", session_id, tenant_id,
         )
 
         return web.json_response({
@@ -261,7 +273,10 @@ async def chat_workflow_save(request: web.Request) -> web.Response:
 
 async def chat_workflow_index(request: web.Request) -> web.Response:
     """Get workflow index for the assistant."""
-    index = await run_in_db_thread(gather_workflow_index)
+    tenant_id = request.get("tenant_id")
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
+    index = await run_in_db_thread(gather_workflow_index, tenant_id)
     return web.json_response({"success": True, "workflow_index": index})
 
 
@@ -271,18 +286,12 @@ async def chat_load_workflow(request: web.Request) -> web.Response:
     tenant_id = request.get("tenant_id")
     if not workflow_id:
         return web.json_response({"success": False, "error": "workflow_id is required"}, status=400)
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
 
-    spec = await run_in_db_thread(load_workflow_spec, workflow_id)
+    spec = await run_in_db_thread(load_workflow_spec, workflow_id, tenant_id)
     if not spec:
         return web.json_response({"success": False, "error": "Workflow not found"}, status=404)
-
-    # 租户隔离：检查所有权
-    if tenant_id:
-        from database.repositories.workflow_repository import WorkflowRepository
-        repo = WorkflowRepository()
-        wf = await run_in_db_thread(repo.find_by_workflow_id, workflow_id)
-        if wf and wf.tenant_id and wf.tenant_id != tenant_id:
-            return web.json_response({"success": False, "error": "Workflow not found"}, status=404)
 
     return web.json_response({"success": True, "workflow_spec": spec})
 

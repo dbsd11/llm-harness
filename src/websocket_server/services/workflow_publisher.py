@@ -86,7 +86,7 @@ class WorkflowPublisher:
             "source_scenario_id": scenario_id,
             "version": version,
             "step_count": len(steps),
-        })
+        }, tenant_id=getattr(scenario, 'tenant_id', None))
 
         logger.info(f"Published workflow {workflow_id} from scenario {scenario_id} "
                      f"with {len(steps)} steps, version {version}")

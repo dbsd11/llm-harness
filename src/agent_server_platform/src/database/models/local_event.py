@@ -15,6 +15,7 @@ class Event(BaseModel):
         "trace_id": str,    # Links related events across a flow
         "metadata": str,    # JSON string with extra context
         "timestamp": datetime,
+        "tenant_id": str,
     }
     __default_order__ = "timestamp DESC"
 

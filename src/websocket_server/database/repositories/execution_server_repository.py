@@ -137,7 +137,7 @@ class ExecutionServerRepository(BaseRepository[ExecutionServer]):
     def list_all(self) -> List[ExecutionServer]:
         return self.find_all(order_by="server_id ASC")
 
-    def delete(self, server_id: str) -> bool:
+    def delete(self, server_id: str, tenant_id: str = None) -> bool:
         """Delete a server row. Only call for offline servers — a connected
         server would be re-upserted on its next heartbeat.
 
@@ -145,11 +145,15 @@ class ExecutionServerRepository(BaseRepository[ExecutionServer]):
         """
         ph = self.placeholder
         sql = f"DELETE FROM {self.table_name} WHERE server_id={ph}"
+        params = [server_id]
+        if tenant_id:
+            sql += f" AND (tenant_id={ph} OR tenant_id IS NULL)"
+            params.append(tenant_id)
         from ..connection import get_connection_manager
         cm = get_connection_manager()
         with cm.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(sql, (server_id,))
+            cursor.execute(sql, params)
             conn.commit()
             return cursor.rowcount > 0
 

@@ -61,7 +61,7 @@ class WSEventSubscriber:
                 logger.info(f"连接到 WS 订阅端点: {self.ws_url}")
                 _ssl = ssl._create_unverified_context() if self.ws_url.startswith("wss") else None
                 _headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else None
-                async with websockets.connect(self.ws_url, ssl=_ssl, extra_headers=_headers) as ws:
+                async with websockets.connect(self.ws_url, ssl=_ssl, additional_headers=_headers) as ws:
                     self._ws = ws
                     backoff = 1
                     logger.info("WS 订阅已连接")

@@ -48,6 +48,8 @@ async def publish_workflow(request: web.Request) -> web.Response:
     description = payload.get("description")
     created_by = payload.get("created_by")
     tenant_id = request.get("tenant_id")
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
 
     try:
         result = await run_in_db_thread(
@@ -81,15 +83,15 @@ async def list_workflows(request: web.Request) -> web.Response:
     state = request.query.get("state")
     limit = int(request.query.get("limit", "100"))
     tenant_id = request.get("tenant_id")
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
 
     try:
         repo = WorkflowRepository()
         if state:
             workflows = await run_in_db_thread(lambda: repo.find_by_state(state, limit=limit, tenant_id=tenant_id))
-        elif tenant_id:
-            workflows = await run_in_db_thread(lambda: repo.find_all_by_tenant(tenant_id, limit=limit))
         else:
-            workflows = await run_in_db_thread(lambda: repo.find_all(limit=limit))
+            workflows = await run_in_db_thread(lambda: repo.find_all_by_tenant(tenant_id, limit=limit))
 
         return web.json_response({
             "success": True,

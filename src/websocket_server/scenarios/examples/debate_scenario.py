@@ -60,11 +60,12 @@ class DebateScenario(BaseScenario):
 
     def run(self) -> Dict[str, Any]:
         sid = self.context.scenario_id
+        _tid = self.context.config.get("tenant_id") if self.context.config else None
         event_bus.emit("scenario.debate_started", {
             "scenario_id": sid,
             "topic": self.topic,
             "rounds": self.rounds,
-        })
+        }, tenant_id=_tid)
 
         try:
             pro_arg = ""
@@ -91,7 +92,8 @@ class DebateScenario(BaseScenario):
                 agent_type="execution",
                 scenario_id=sid,
                 timeout_seconds=self.timeout,
-                context={"role": "裁判", "system_prompt": self.judge_prompt},
+                context={"role": "裁判", "system_prompt": self.judge_prompt,
+                         "tenant_id": _tid},
             )
             judge_res = self.wait_for_task(judge_task, timeout=self.timeout)
             verdict = self._extract_output(judge_res, "裁判")
@@ -99,7 +101,7 @@ class DebateScenario(BaseScenario):
             event_bus.emit("scenario.debate_completed", {
                 "scenario_id": sid,
                 "task_state": judge_res["state"],
-            })
+            }, tenant_id=_tid)
 
             return {
                 "success": judge_res["state"] == "success",
@@ -113,7 +115,8 @@ class DebateScenario(BaseScenario):
         except Exception as e:
             err = str(e)
             logger.error(f"Debate scenario error: {err}")
-            event_bus.emit("scenario.debate_failed", {"scenario_id": sid, "error": err})
+            event_bus.emit("scenario.debate_failed", {"scenario_id": sid, "error": err},
+                           tenant_id=_tid)
             return {"success": False, "error": err}
 
     def _submit_side(self, side: str, system_prompt: str,
@@ -122,12 +125,14 @@ class DebateScenario(BaseScenario):
         goal = f"辩题：{self.topic}\n请作为{side}进行论证。"
         if opponent_prior:
             goal += f"\n\n对方{round_label}观点：\n{opponent_prior}\n请在此基础上反驳。"
+        _tid = self.context.config.get("tenant_id") if self.context.config else None
         return agent_manager.submit_task(
             goal=goal,
             agent_type="execution",
             scenario_id=self.context.scenario_id,
             timeout_seconds=self.timeout,
-            context={"role": side, "system_prompt": system_prompt},
+            context={"role": side, "system_prompt": system_prompt,
+                     "tenant_id": _tid},
         )
 
     def _judge_goal(self, pro: str, con: str) -> str:

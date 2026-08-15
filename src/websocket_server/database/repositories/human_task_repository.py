@@ -41,14 +41,18 @@ class HumanTaskRepository(BaseRepository[HumanTask]):
         results = self.find_by_criteria({"task_id": task_id}, limit=1)
         return results[0] if results else None
 
-    def mark_submitted(self, task_id: str) -> bool:
+    def mark_submitted(self, task_id: str, tenant_id: str = None) -> bool:
         """Mark a human task as submitted."""
         ph = self.placeholder
         sql = f"UPDATE {self.table_name} SET status={ph} WHERE task_id={ph}"
+        params = ["submitted", task_id]
+        if tenant_id:
+            sql += f" AND (tenant_id = {ph} OR tenant_id IS NULL)"
+            params.append(tenant_id)
         from database.connection import get_connection_manager
         cm = get_connection_manager()
         with cm.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(sql, ("submitted", task_id))
+            cursor.execute(sql, params)
             conn.commit()
             return cursor.rowcount > 0

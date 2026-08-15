@@ -15,6 +15,7 @@ import multiprocessing
 
 from database import init_database, close_database
 from logger import logger
+from core.local_tenant import init_tenant
 from core.local_watchdog import watchdog
 
 
@@ -94,6 +95,9 @@ def main():
     # Default to --all if no option specified
     if not (args.gradio_only or args.flask_only or args.all):
         args.all = True
+
+    # Initialize tenant context from JWT before database (migration needs tenant_id)
+    init_tenant()
 
     # Initialize database
     logger.info("Initializing database...")

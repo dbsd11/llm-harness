@@ -8,6 +8,7 @@ from datetime import datetime
 
 from database.repositories.agent_repository import AgentRepository
 from database.repositories.task_repository import TaskRepository
+from database.repositories.scenario_repository import ScenarioRepository
 from database.models.task import Task
 from core.agents.base_agent import BaseAgent, AgentRun
 from core.agents.scheduling_agent import SchedulingAgent
@@ -32,6 +33,7 @@ class AgentManager:
     def __init__(self):
         self.agent_repo = AgentRepository()
         self.task_repo = TaskRepository()
+        self.scenario_repo = ScenarioRepository()
         self.agent_runs: Dict[str, AgentRun] = {}
         # ponytail: store classes, not instances — fresh agent per scenario
         self.agent_registry: Dict[str, type] = {}
@@ -65,6 +67,21 @@ class AgentManager:
         task_id = str(uuid.uuid4())
         agent_run_id = str(uuid.uuid4())
 
+        # Resolve tenant_id: context → scenario DB row (defense-in-depth)
+        tenant_id = (context or {}).get("tenant_id")
+        if not tenant_id and scenario_id:
+            try:
+                _sc = self.scenario_repo.find_by_scenario_id(scenario_id)
+                if _sc:
+                    tenant_id = getattr(_sc, 'tenant_id', None)
+            except Exception:
+                pass
+        if not tenant_id:
+            # ponytail: log the gap so missing tenant_id surfaces in logs
+            # instead of silently creating invisible (tenant-filtered-out) tasks.
+            logger.warning(f"submit_task: tenant_id is None for scenario_id={scenario_id}, "
+                           f"goal={goal[:60]!r} — task will be invisible to tenant-filtered queries")
+
         # Create task (with agent_run_id for cleanup tracking)
         task = Task(
             task_id=task_id,
@@ -76,6 +93,7 @@ class AgentManager:
             max_retries=3,
             retry_count=0,
             scenario_id=scenario_id,
+            tenant_id=tenant_id,
             context=json.dumps(context or {}),
             created_at=datetime.now(),
             updated_at=datetime.now()
@@ -111,7 +129,7 @@ class AgentManager:
             "task_id": task_id,
             "goal": goal,
             "agent_type": agent_type,
-        })
+        }, tenant_id=(context or {}).get("tenant_id"))
 
         logger.info(f"Submitted task: {task_id} ({goal})")
         return task_id
@@ -129,7 +147,8 @@ class AgentManager:
                 return
 
             logger.info(f"Task marked as started: {agent_run.task_id}")
-            event_bus.emit("task.started", {"task_id": agent_run.task_id})
+            event_bus.emit("task.started", {"task_id": agent_run.task_id},
+                           tenant_id=agent_run.config.get("tenant_id"))
 
             # Execute agent - use the context from agent_run
             task = self.task_repo.find_by_task_id(agent_run.task_id)
@@ -137,6 +156,7 @@ class AgentManager:
             context["goal"] = task.goal
             context["task_id"] = agent_run.task_id
             context["scenario_id"] = task.scenario_id
+            context["tenant_id"] = task.tenant_id
 
             # Inject agent_roles from the scenario config so the SchedulingAgent
             # can resolve per-role execution-server routing (server_id).
@@ -145,8 +165,12 @@ class AgentManager:
                     from database.repositories.scenario_repository import ScenarioRepository
                     scenario = ScenarioRepository().find_by_scenario_id(task.scenario_id)
                     if scenario and scenario.config:
-                        scenario_config = json.loads(scenario.config)
-                        context["agent_roles"] = scenario_config.get("agent_roles", {})
+                        if getattr(scenario, 'tenant_id', None) and scenario.tenant_id != task.tenant_id:
+                            logger.warning(f"Scenario {task.scenario_id} belongs to different tenant, "
+                                           f"skipping agent_roles injection")
+                        else:
+                            scenario_config = json.loads(scenario.config)
+                            context["agent_roles"] = scenario_config.get("agent_roles", {})
                 except Exception as e:
                     logger.warning(f"Could not load agent_roles for scenario "
                                    f"{task.scenario_id}: {e}")
@@ -181,7 +205,7 @@ class AgentManager:
                 event_bus.emit("task.completed", {
                     "task_id": agent_run.task_id,
                     "result": result,
-                })
+                }, tenant_id=task.tenant_id)
 
                 logger.info(f"Task completed: {agent_run.task_id}")
 
@@ -197,7 +221,7 @@ class AgentManager:
                 event_bus.emit("task.failed", {
                     "task_id": agent_run.task_id,
                     "error": error,
-                })
+                }, tenant_id=task.tenant_id)
 
                 logger.error(f"Task failed: {agent_run.task_id} - {error}")
 
@@ -211,10 +235,11 @@ class AgentManager:
             agent_run.fail(error_msg)
             self.task_repo.mark_as_failed(agent_run.task_id, error_msg)
 
+            _t = self.task_repo.find_by_task_id(agent_run.task_id)
             event_bus.emit("task.failed", {
                 "task_id": agent_run.task_id,
                 "error": error_msg,
-            })
+            }, tenant_id=_t.tenant_id if _t else None)
 
         finally:
             # Cleanup agent run after completion
@@ -244,7 +269,7 @@ class AgentManager:
                 "total_subtasks": len(siblings),
                 "success_count": success_count,
                 "failed_count": len(siblings) - success_count,
-            })
+            }, tenant_id=task.tenant_id)
             logger.info(f"Topic {task.topic_id} completed: "
                         f"{success_count}/{len(siblings)} succeeded")
 
@@ -264,9 +289,11 @@ class AgentManager:
                 return True
         return False
 
-    def list_agents(self) -> list:
-        """List all registered agents"""
-        return self.agent_repo.find_all()
+    def list_agents(self, tenant_id: str = None) -> list:
+        """List registered agents, filtered by tenant."""
+        if tenant_id:
+            return self.agent_repo.find_all_by_tenant(tenant_id)
+        return []
 
     def list_agent_runs(self, limit: int = 100) -> list:
         """List recent agent runs"""

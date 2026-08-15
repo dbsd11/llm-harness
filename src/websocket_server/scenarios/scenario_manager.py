@@ -31,7 +31,8 @@ class ScenarioManager:
         self.lock = threading.Lock()
 
     def create_scenario(self, scenario_type: str, name: str, description: str = "",
-                       config: Dict[str, Any] = None, created_by: int = None) -> str:
+                       config: Dict[str, Any] = None, created_by: int = None,
+                       tenant_id: str = None) -> str:
         """
         Create a new scenario.
 
@@ -41,6 +42,7 @@ class ScenarioManager:
             description: Scenario description
             config: Scenario configuration
             created_by: User ID who created the scenario
+            tenant_id: Tenant ID for multi-tenant isolation
 
         Returns:
             Scenario ID
@@ -57,6 +59,7 @@ class ScenarioManager:
             config=json.dumps(config or {}),
             context=json.dumps({"trace_id": trace_id}),
             created_by=created_by,
+            tenant_id=tenant_id,
             created_at=datetime.now(),
             updated_at=datetime.now()
         )
@@ -67,14 +70,15 @@ class ScenarioManager:
             "scenario_id": scenario_id,
             "scenario_type": scenario_type,
             "name": name,
-        }, trace_id=trace_id)
+        }, trace_id=trace_id, tenant_id=tenant_id)
 
         logger.info(f"Created scenario: {scenario_id} ({scenario_type}) trace:{trace_id}")
         return scenario_id
 
     def update_scenario(self, scenario_id: str, name: str = None,
                         description: str = None, config: Dict[str, Any] = None,
-                        scenario_type: str = None) -> bool:
+                        scenario_type: str = None,
+                        tenant_id: str = None) -> bool:
         """更新已有场景的可编辑字段（scenario_type/name/description/config），不改状态。
 
         用于「确认保存」对已落库场景的二次修改：避免每次都新建一条记录。
@@ -84,6 +88,10 @@ class ScenarioManager:
         scenario = self.scenario_repo.find_by_scenario_id(scenario_id)
         if not scenario:
             logger.error(f"update_scenario: scenario not found: {scenario_id}")
+            return False
+
+        if tenant_id and getattr(scenario, 'tenant_id', None) and scenario.tenant_id != tenant_id:
+            logger.warning(f"update_scenario: tenant mismatch for {scenario_id}")
             return False
 
         # Enforce editability rule (D6): manual_acceptance editable only while initializing
@@ -102,6 +110,11 @@ class ScenarioManager:
             scenario.description = description
         if config is not None:
             scenario.config = json.dumps(config)
+        # ponytail: persist tenant_id — previously only validated but never written,
+        # leaving scenarios with NULL tenant_id if created before the column was
+        # added or via a path that skipped the post-save patch.
+        if tenant_id and not getattr(scenario, 'tenant_id', None):
+            scenario.tenant_id = tenant_id
         scenario.updated_at = datetime.now()
 
         ok = self.scenario_repo.update(scenario)
@@ -115,18 +128,20 @@ class ScenarioManager:
         event_bus.emit("scenario.updated", {
             "scenario_id": scenario_id,
             "name": scenario.name,
-        }, trace_id=trace_id)
+        }, trace_id=trace_id, tenant_id=getattr(scenario, 'tenant_id', None))
 
         logger.info(f"Updated scenario: {scenario_id}")
         return ok
 
-    def start_scenario(self, scenario_id: str, scenario_instance: BaseScenario) -> bool:
+    def start_scenario(self, scenario_id: str, scenario_instance: BaseScenario,
+                       tenant_id: str = None) -> bool:
         """
         Start scenario execution.
 
         Args:
             scenario_id: Scenario ID
             scenario_instance: Scenario instance to execute
+            tenant_id: Tenant ID for ownership verification
 
         Returns:
             True if started successfully
@@ -135,6 +150,10 @@ class ScenarioManager:
         scenario = self.scenario_repo.find_by_scenario_id(scenario_id)
         if not scenario:
             logger.error(f"Scenario not found: {scenario_id}")
+            return False
+
+        if tenant_id and getattr(scenario, 'tenant_id', None) and scenario.tenant_id != tenant_id:
+            logger.warning(f"start_scenario: tenant mismatch for {scenario_id}")
             return False
 
         # Validate state transition
@@ -160,6 +179,7 @@ class ScenarioManager:
         config = json.loads(scenario.config) if scenario.config else {}
         config["scenario_id"] = scenario_id
         config["trace_id"] = trace_id
+        config["tenant_id"] = getattr(scenario, 'tenant_id', None)
 
         # Materialize the scenario's declared agent topology (scheduling +
         # execution roles) into the agents table. In the decoupled architecture
@@ -167,7 +187,8 @@ class ScenarioManager:
         # registered as a side-effect of task submission — register the declared
         # roles here so the registry reflects who participates. Scoped to the
         # scenario lifecycle (cleaned by _release_scenario_agents on release).
-        self._register_declared_agents(scenario_id, config)
+        self._register_declared_agents(scenario_id, config,
+                                       getattr(scenario, 'tenant_id', None))
 
         thread = threading.Thread(
             target=self._execute_scenario,
@@ -178,12 +199,13 @@ class ScenarioManager:
 
         event_bus.emit("scenario.started", {
             "scenario_id": scenario_id,
-        }, trace_id=trace_id)
+        }, trace_id=trace_id, tenant_id=getattr(scenario, 'tenant_id', None))
 
         logger.info(f"Started scenario: {scenario_id} trace:{trace_id}")
         return True
 
-    def _register_declared_agents(self, scenario_id: str, config: Dict[str, Any]) -> None:
+    def _register_declared_agents(self, scenario_id: str, config: Dict[str, Any],
+                                  tenant_id: str = None) -> None:
         """Register the scenario's declared agent topology into the agents table.
 
         Writes one row per declared agent (scheduling + each execution role),
@@ -206,6 +228,7 @@ class ScenarioManager:
                     agent_type=agent_type,
                     name=name,
                     description="",
+                    tenant_id=tenant_id,
                     config=json.dumps(cfg, ensure_ascii=False),
                     status="active",
                     created_at=now, updated_at=now,
@@ -260,6 +283,8 @@ class ScenarioManager:
     def _execute_scenario(self, scenario_id: str, scenario: BaseScenario,
                          config: Dict[str, Any], trace_id: str = None):
         """Execute scenario in background thread with trace propagation"""
+        db_scenario = self.scenario_repo.find_by_scenario_id(scenario_id)
+        _tenant_id = getattr(db_scenario, 'tenant_id', None) if db_scenario else None
         try:
             # Execute scenario
             result = scenario.start(config)
@@ -293,7 +318,7 @@ class ScenarioManager:
                     "scenario_id": scenario_id,
                     "error": error_msg,
                     "result": result,
-                }, trace_id=trace_id)
+                }, trace_id=trace_id, tenant_id=_tenant_id)
                 logger.warning(f"Scenario failed (non-success result): "
                                f"{scenario_id} - {error_msg}")
             else:
@@ -301,7 +326,7 @@ class ScenarioManager:
                 event_bus.emit("scenario.completed", {
                     "scenario_id": scenario_id,
                     "result": result,
-                }, trace_id=trace_id)
+                }, trace_id=trace_id, tenant_id=_tenant_id)
                 logger.info(f"Scenario completed: {scenario_id}")
 
         except Exception as e:
@@ -314,7 +339,7 @@ class ScenarioManager:
             event_bus.emit("scenario.failed", {
                 "scenario_id": scenario_id,
                 "error": error_msg,
-            }, trace_id=trace_id)
+            }, trace_id=trace_id, tenant_id=_tenant_id)
 
         finally:
             if config.get("manual_acceptance"):
@@ -341,6 +366,8 @@ class ScenarioManager:
         from core.agents.agent_manager import agent_manager
         from database.repositories.task_repository import TaskRepository
         from database.repositories.consumer_offset_repository import ConsumerOffsetRepository
+        _db_s = self.scenario_repo.find_by_scenario_id(scenario_id)
+        _tenant_id = getattr(_db_s, 'tenant_id', None) if _db_s else None
 
         # 1. Clean consumer offsets for this scenario
         try:
@@ -357,7 +384,7 @@ class ScenarioManager:
         try:
             from database.repositories.agent_repository import AgentRepository
             agent_repo = AgentRepository()
-            deleted = agent_repo.delete_by_scenario_id(scenario_id)
+            deleted = agent_repo.delete_by_scenario_id(scenario_id, _tenant_id)
             if deleted > 0:
                 logger.info(f"Cleaned {deleted} agent DB record(s) for scenario {scenario_id}")
         except Exception as e:
@@ -392,7 +419,7 @@ class ScenarioManager:
                 "scenario_id": scenario_id,
                 "released_runs": released_runs,
                 "cancelled_tasks": cancelled_tasks,
-            }, trace_id=trace_id)
+            }, trace_id=trace_id, tenant_id=_tenant_id)
             logger.info(f"Scenario {scenario_id}: released {released_runs} agent run(s), "
                        f"cancelled {cancelled_tasks} task(s)")
 
@@ -432,7 +459,7 @@ class ScenarioManager:
             "scenario_id": task.scenario_id,
             "passed": passed,
             "feedback": feedback,
-        }, trace_id=trace_id)
+        }, trace_id=trace_id, tenant_id=getattr(scenario, 'tenant_id', None))
 
         # Check if we can advance the review cycle
         self.advance_review_cycle(task.scenario_id)
@@ -489,13 +516,14 @@ class ScenarioManager:
                         "resume_cycle": True,
                         "manual_acceptance": True,
                         "agent_roles": config.get("agent_roles", {}),
+                        "tenant_id": getattr(scenario, 'tenant_id', None),
                     },
                 )
 
                 event_bus.emit("scenario.review_cycle_advanced", {
                     "scenario_id": scenario_id,
                     "reason": "resume_cycle",
-                }, trace_id=trace_id)
+                }, trace_id=trace_id, tenant_id=getattr(scenario, 'tenant_id', None))
 
                 logger.info(f"Scenario {scenario_id} advanced to next review cycle")
             else:
@@ -506,7 +534,7 @@ class ScenarioManager:
                 event_bus.emit("scenario.completed", {
                     "scenario_id": scenario_id,
                     "reason": "all_tasks_passed",
-                }, trace_id=trace_id)
+                }, trace_id=trace_id, tenant_id=getattr(scenario, 'tenant_id', None))
 
                 logger.info(f"Scenario {scenario_id} completed (all tasks passed review)")
 
@@ -529,16 +557,17 @@ class ScenarioManager:
 
             event_bus.emit("scenario.awaiting_review", {
                 "scenario_id": scenario_id,
-            }, trace_id=trace_id)
+            }, trace_id=trace_id, tenant_id=getattr(scenario, 'tenant_id', None))
 
             logger.info(f"Scenario {scenario_id} paused for manual review")
 
-    def stop_scenario(self, scenario_id: str) -> bool:
+    def stop_scenario(self, scenario_id: str, tenant_id: str = None) -> bool:
         """
         Stop scenario execution.
 
         Args:
             scenario_id: Scenario ID
+            tenant_id: Tenant ID for ownership verification
 
         Returns:
             True if stopped successfully
@@ -546,6 +575,10 @@ class ScenarioManager:
         scenario = self.scenario_repo.find_by_scenario_id(scenario_id)
         if not scenario:
             logger.error(f"Scenario not found: {scenario_id}")
+            return False
+
+        if tenant_id and getattr(scenario, 'tenant_id', None) and scenario.tenant_id != tenant_id:
+            logger.warning(f"stop_scenario: tenant mismatch for {scenario_id}")
             return False
 
         # Extract trace_id for event propagation
@@ -570,7 +603,7 @@ class ScenarioManager:
 
         event_bus.emit("scenario.stopped", {
             "scenario_id": scenario_id,
-        }, trace_id=trace_id)
+        }, trace_id=trace_id, tenant_id=getattr(scenario, 'tenant_id', None))
 
         logger.info(f"Stopped scenario: {scenario_id}")
         return True

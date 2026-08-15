@@ -73,16 +73,25 @@ class EventRepository(BaseRepository[Event]):
     find_by_type = find_by_event_type
     find_by_trace = find_by_trace_id
 
-    def find_by_event_type_prefix(self, prefix: str, limit: int = 100) -> List[Event]:
+    def find_by_event_type_prefix(self, prefix: str, limit: int = 100,
+                                  tenant_id: str = None) -> List[Event]:
         """Find events by event type prefix (e.g., 'task.*')"""
         placeholder = '%s' if self.db_engine == 'mysql' else '?'
-        sql = f"SELECT * FROM {self.table_name} WHERE event_type LIKE {placeholder} ORDER BY timestamp DESC LIMIT {placeholder}"
+        sql = f"SELECT * FROM {self.table_name} WHERE event_type LIKE {placeholder}"
+        params = [f"{prefix}%"]
+
+        if tenant_id:
+            sql += f" AND (tenant_id = {placeholder} OR tenant_id IS NULL)"
+            params.append(tenant_id)
+
+        sql += f" ORDER BY timestamp DESC LIMIT {placeholder}"
+        params.append(limit)
 
         from ..connection import get_connection_manager
         connection_manager = get_connection_manager()
         with connection_manager.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(sql, (f"{prefix}%", limit))
+            cursor.execute(sql, params)
             rows = cursor.fetchall()
 
             result = []
@@ -92,6 +101,8 @@ class EventRepository(BaseRepository[Event]):
 
             return result
 
-    def find_recent(self, limit: int = 100) -> List[Event]:
-        """Find recent events"""
+    def find_recent(self, limit: int = 100, tenant_id: str = None) -> List[Event]:
+        """Find recent events (tenant-scoped)"""
+        if tenant_id:
+            return self._tenant_query({}, tenant_id, limit=limit)
         return self.find_all(limit=limit)

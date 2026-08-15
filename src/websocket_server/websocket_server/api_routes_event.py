@@ -19,6 +19,8 @@ async def list_events(request: web.Request) -> web.Response:
     trace_id = request.query.get("trace_id")
     limit = int(request.query.get("limit", "100"))
     tenant_id = request.get("tenant_id")
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
 
     try:
         repo = EventRepository()
@@ -26,10 +28,8 @@ async def list_events(request: web.Request) -> web.Response:
             events = await run_in_db_thread(lambda: repo.find_by_type(event_type, limit=limit, tenant_id=tenant_id))
         elif trace_id:
             events = await run_in_db_thread(lambda: repo.find_by_trace(trace_id, limit=limit, tenant_id=tenant_id))
-        elif tenant_id:
-            events = await run_in_db_thread(lambda: repo.find_all_by_tenant(tenant_id, limit=limit))
         else:
-            events = await run_in_db_thread(lambda: repo.find_all(limit=limit))
+            events = await run_in_db_thread(lambda: repo.find_all_by_tenant(tenant_id, limit=limit))
 
         result = []
         for e in events:

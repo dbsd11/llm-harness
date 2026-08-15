@@ -1,10 +1,11 @@
 # 基础仓储类
 import os
-from typing import Dict, Any, List, Optional, Type, TypeVar, Generic
+from typing import Dict, Any, List, Optional, Tuple, Type, TypeVar, Generic
 from datetime import datetime
 
 from ..local_connection import get_connection_manager
 from ..models.local_base import BaseModel
+from core.local_tenant import get_tenant_id
 
 T = TypeVar('T', bound=BaseModel)
 
@@ -20,7 +21,17 @@ class BaseRepository(Generic[T]):
         self.db_engine = os.getenv('DB_ENGINE', 'sqlite')
         # 根据数据库类型设置占位符
         self.placeholder = '%s' if self.db_engine == 'mysql' else '?'
-    
+        self._has_tenant = "tenant_id" in self.model_class.__fields__
+
+    def _tenant_clause(self) -> Tuple[str, list]:
+        """Return (SQL fragment, values) for tenant filtering.
+        Uses compat mode: includes NULL rows so pre-migration data stays visible."""
+        tid = get_tenant_id() if self._has_tenant else None
+        if not tid:
+            return "", []
+        ph = self.placeholder
+        return f" AND tenant_id = {ph}", [tid]
+
     def create_table_if_not_exists(self):
         """创建表（如果不存在）"""
         sql = self.model_class.get_create_table_sql()
@@ -37,6 +48,10 @@ class BaseRepository(Generic[T]):
         # 移除ID字段（如果是自增主键）
         if self.primary_key in data and data[self.primary_key] is None:
             del data[self.primary_key]
+        
+        # Auto-inject tenant_id for tenant-aware models
+        if self._has_tenant and data.get("tenant_id") is None:
+            data["tenant_id"] = get_tenant_id()
         
         fields = list(data.keys())
         
@@ -158,8 +173,12 @@ class BaseRepository(Generic[T]):
     
     def find_all(self, organization_id: int = None, order_by: str = None, limit: int = None, offset: int = None) -> List[T]:
         """查找所有记录"""
+        tenant_sql, tenant_vals = self._tenant_clause()
+
         if organization_id:
-            sql = f"SELECT * FROM {self.table_name} WHERE organization_id = {organization_id}"
+            sql = f"SELECT * FROM {self.table_name} WHERE organization_id = {organization_id}{tenant_sql}"
+        elif tenant_sql:
+            sql = f"SELECT * FROM {self.table_name} WHERE 1=1{tenant_sql}"
         else:
             sql = f"SELECT * FROM {self.table_name}"
         
@@ -178,7 +197,7 @@ class BaseRepository(Generic[T]):
         connection_manager = get_connection_manager()
         with connection_manager.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(sql)
+            cursor.execute(sql, tenant_vals)
             rows = cursor.fetchall()
             
             result = []
@@ -220,7 +239,9 @@ class BaseRepository(Generic[T]):
                 values.append(value)
         
         where_clause = " AND ".join(where_clauses)
-        sql = f"SELECT * FROM {self.table_name} WHERE {where_clause}"
+        tenant_sql, tenant_vals = self._tenant_clause()
+        sql = f"SELECT * FROM {self.table_name} WHERE {where_clause}{tenant_sql}"
+        values.extend(tenant_vals)
         
         # 添加排序
         if order_by:
@@ -261,6 +282,11 @@ class BaseRepository(Generic[T]):
             
             where_clause = " AND ".join(where_clauses)
             sql += f" WHERE {where_clause}"
+
+        tenant_sql, tenant_vals = self._tenant_clause()
+        if tenant_sql:
+            sql += f"{' WHERE 1=1' if not criteria else ''}{tenant_sql}"
+            values.extend(tenant_vals)
         
         connection_manager = get_connection_manager()
         with connection_manager.get_connection() as conn:
@@ -288,6 +314,11 @@ class BaseRepository(Generic[T]):
         if organization_id:
             where_clauses.append(f"organization_id = {self.placeholder}")
             values.append(organization_id)
+
+        tenant_sql, tenant_vals = self._tenant_clause()
+        if tenant_sql:
+            where_clauses.append(f"tenant_id = {self.placeholder}")
+            values.extend(tenant_vals)
 
         where_clause = " AND ".join(where_clauses)
         sql = f"SELECT * FROM {self.table_name} WHERE {where_clause} {order_clause} LIMIT {limit}"

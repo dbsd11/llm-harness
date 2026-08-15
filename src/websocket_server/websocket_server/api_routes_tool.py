@@ -35,8 +35,11 @@ async def get_tool(request: web.Request) -> web.Response:
 
 
 async def delete_tool(request: web.Request) -> web.Response:
-    """Unregister a tool (hot-swap)."""
+    """Unregister a tool (hot-swap). Requires authentication."""
     tool_name = request.match_info["tool_name"]
+    tenant_id = request.get("tenant_id")
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
     try:
         removed = tool_registry.unregister(tool_name)
         if not removed:

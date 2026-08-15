@@ -53,10 +53,53 @@ def init_database():
         AssistantMessageRepository()._ensure_columns()
         logger.info("AssistantMessage table migration complete")
 
+        _migrate_tenant_id(models)
+
         return True
     except Exception as e:
         logger.error(f"Failed to initialize database: {str(e)}")
         return False
+
+
+def _migrate_tenant_id(models: List[Type[BaseModel]]):
+    """Add tenant_id column + index to all tables, backfill existing rows."""
+    from core.local_tenant import get_tenant_id
+    tenant_id = get_tenant_id()
+
+    with get_connection_manager().get_connection() as conn:
+        cursor = conn.cursor()
+
+        for model_class in models:
+            table = model_class.__tablename__
+            try:
+                cursor.execute(f"PRAGMA table_info({table})")
+                columns = {row[1] for row in cursor.fetchall()}
+                if "tenant_id" not in columns:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN tenant_id TEXT")
+                    logger.info(f"Added tenant_id column to {table}")
+            except Exception as e:
+                logger.warning(f"Failed to add tenant_id to {table}: {e}")
+
+            try:
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table}_tenant ON {table}(tenant_id)"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to create index on {table}: {e}")
+
+            if tenant_id:
+                try:
+                    cursor.execute(
+                        f"UPDATE {table} SET tenant_id = ? WHERE tenant_id IS NULL",
+                        (tenant_id,)
+                    )
+                    if cursor.rowcount > 0:
+                        logger.info(f"Backfilled {cursor.rowcount} rows in {table} with tenant {tenant_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to backfill {table}: {e}")
+
+        conn.commit()
+    logger.info("Tenant ID migration complete")
 
 
 def close_database():

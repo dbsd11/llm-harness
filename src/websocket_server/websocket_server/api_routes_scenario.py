@@ -41,6 +41,8 @@ def _scenario_to_dict(s) -> dict:
 async def create_scenario(request: web.Request) -> web.Response:
     """Create a new scenario (tenant-isolated)."""
     tenant_id = request.get("tenant_id")
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
     try:
         payload = await request.json()
     except Exception:
@@ -63,13 +65,8 @@ async def create_scenario(request: web.Request) -> web.Response:
     try:
         scenario_id = await run_in_db_thread(
             scenario_manager.create_scenario,
-            scenario_type, name, description, config, created_by,
+            scenario_type, name, description, config, created_by, tenant_id,
         )
-
-        # 设置 tenant_id
-        if tenant_id:
-            repo = ScenarioRepository()
-            await run_in_db_thread(repo.update_tenant_id, scenario_id, tenant_id)
 
         # Broadcast event
         ws_server = request.app.get("ws_server")
@@ -94,15 +91,15 @@ async def list_scenarios(request: web.Request) -> web.Response:
     state = request.query.get("state")
     limit = int(request.query.get("limit", "100"))
     tenant_id = request.get("tenant_id")
+    if not tenant_id:
+        return web.json_response({"success": False, "error": "tenant_id required"}, status=401)
 
     try:
         repo = ScenarioRepository()
         if state:
             scenarios = await run_in_db_thread(lambda: repo.find_by_state(state, limit=limit, tenant_id=tenant_id))
-        elif tenant_id:
-            scenarios = await run_in_db_thread(lambda: repo.find_all_by_tenant(tenant_id, limit=limit))
         else:
-            scenarios = await run_in_db_thread(lambda: repo.find_all(limit=limit))
+            scenarios = await run_in_db_thread(lambda: repo.find_all_by_tenant(tenant_id, limit=limit))
 
         return web.json_response({
             "success": True,
@@ -166,7 +163,7 @@ async def start_scenario(request: web.Request) -> web.Response:
                 "success": False, "error": f"Unknown scenario type: {stype}",
             }, status=400)
 
-        ok = await run_in_db_thread(scenario_manager.start_scenario, scenario_id, instance)
+        ok = await run_in_db_thread(scenario_manager.start_scenario, scenario_id, instance, tenant_id)
         if not ok:
             return web.json_response({"success": False, "error": "Failed to start scenario"}, status=500)
 
@@ -194,7 +191,7 @@ async def stop_scenario(request: web.Request) -> web.Response:
             if scenario and scenario.tenant_id and scenario.tenant_id != tenant_id:
                 return web.json_response({"success": False, "error": "Scenario not found"}, status=404)
 
-        ok = await run_in_db_thread(scenario_manager.stop_scenario, scenario_id)
+        ok = await run_in_db_thread(scenario_manager.stop_scenario, scenario_id, tenant_id)
         if not ok:
             return web.json_response({"success": False, "error": "Scenario not found"}, status=404)
 

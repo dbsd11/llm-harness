@@ -41,86 +41,165 @@ _MODIFY_KEYWORDS = ("修改", "编辑", "调整", "更新", "变更", "重命名
 _ID_RE = re.compile(r"(?<![a-zA-Z0-9])([0-9a-fA-F]{4,36})(?![a-zA-Z0-9])")
 
 
-# ── 上下文采集 ─────────────────────────────────────────────────────────────
+# ── Tool 定义（OpenAI function calling 格式） ─────────────────────────────────
 
-def gather_scene_index() -> str:
-    """返回现有场景清单文本，注入 system prompt 供助手回答场景相关问题。"""
-    scenarios = ScenarioRepository().find_all()
-    if not scenarios:
-        return "（当前数据库中没有任何场景）"
-    lines = []
-    for s in scenarios:
-        sid = (s.scenario_id or "")[:8]
-        type_zh = _SCENARIO_TYPE_ZH.get(s.scenario_type, s.scenario_type or "?")
-        lines.append(f"- [{sid}] {s.name or '未命名'} | 类型:{type_zh} | 状态:{s.state or '?'}")
-    return "\n".join(lines)
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_execution_servers",
+            "description": "查询当前租户可用的执行 Agent 服务器列表（含 server_id、名称、在线状态）。创建场景需要填写 server_id 时必须先调用此工具。",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_human_servers",
+            "description": "查询当前租户可用的人工 Agent 服务器列表（含 server_id、名称、状态）。需要将任务路由给真人时调用此工具。",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_scenarios",
+            "description": "查询当前租户的所有场景列表（含 scenario_id、名称、类型、状态）。回答场景相关问题时先调用此工具。",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+]
+
+_MAX_REACT_ITERATIONS = 5
 
 
-def gather_human_servers() -> str:
-    """返回已注册的人工 Agent 服务器清单，供 LLM 在配置 execution_agents 时引用 server_id。"""
-    import os
-    import requests
+# ── Tool Handler ─────────────────────────────────────────────────────────────
 
-    ws_url = os.getenv("WS_SERVER_API_URL", "https://agent-socket-server.bdzz.com.cn:8765")
+def _handle_list_execution_servers() -> str:
+    from core.local_websocket_api_client import list_servers
     try:
-        resp = requests.get(f"{ws_url}/api/servers", timeout=5, verify=False)
-        resp.raise_for_status()
-        data = resp.json()
+        data = list_servers()
+        if not data.get("success", True) and "error" in data:
+            raise RuntimeError(data["error"])
         servers = data.get("servers", [])
     except Exception as e:
-        logger.warning(f"Failed to fetch servers from WS hub: {e}")
-        return "（无法获取人工 Agent 服务器列表）"
-
-    # 显示所有注册的人工 Agent（包括离线的），让 LLM 知道有哪些可用
-    human = [s for s in servers if s.get("source") == "human_agent"]
-    if not human:
-        return "（当前没有已注册的人工 Agent 服务器）"
-    lines = []
-    for s in human:
-        lines.append(f"- server_id: `{s['server_id']}` | 名称: {s.get('name', '')} | 状态: {s.get('status', 'unknown')}")
-    return "\n".join(lines)
-
-
-def gather_execution_servers() -> str:
-    """返回已注册的执行 Agent 服务器清单（含在线状态），供 LLM 准确分配 server_id。"""
-    import os
-    import requests
-
-    ws_url = os.getenv("WS_SERVER_API_URL", "https://agent-socket-server.bdzz.com.cn:8765")
-    try:
-        resp = requests.get(f"{ws_url}/api/servers", timeout=5, verify=False)
-        resp.raise_for_status()
-        data = resp.json()
-        servers = data.get("servers", [])
-    except Exception as e:
-        logger.warning(f"Failed to fetch servers from WS hub: {e}")
-        return "（无法获取执行服务器列表）"
+        logger.warning(f"Failed to fetch servers: {e}")
+        return json.dumps({"error": "无法获取执行服务器列表"}, ensure_ascii=False)
 
     exec_servers = [s for s in servers if s.get("source") != "human_agent"]
-    if not exec_servers:
-        return "（当前没有已注册的执行 Agent 服务器，execution_agents 中不要填写 server_id）"
-    lines = []
+    result = []
     for s in exec_servers:
-        connected = s.get("connected", False)
-        status = s.get("status", "unknown")
-        online_mark = "✅" if connected or status in ("idle", "running") else "⚠️离线"
-        lines.append(f"- server_id: `{s['server_id']}` | 名称: {s.get('name', '')} | {online_mark}")
-    return "\n".join(lines)
+        result.append({
+            "server_id": s.get("server_id", ""),
+            "name": s.get("name", ""),
+            "status": s.get("status", "unknown"),
+            "connected": s.get("connected", False),
+        })
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _handle_list_human_servers() -> str:
+    from core.local_websocket_api_client import list_servers
+    try:
+        data = list_servers()
+        if not data.get("success", True) and "error" in data:
+            raise RuntimeError(data["error"])
+        servers = data.get("servers", [])
+    except Exception as e:
+        logger.warning(f"Failed to fetch servers: {e}")
+        return json.dumps({"error": "无法获取人工 Agent 服务器列表"}, ensure_ascii=False)
+
+    human = [s for s in servers if s.get("source") == "human_agent"]
+    result = []
+    for s in human:
+        result.append({
+            "server_id": s.get("server_id", ""),
+            "name": s.get("name", ""),
+            "status": s.get("status", "unknown"),
+        })
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _handle_list_scenarios() -> str:
+    try:
+        scenarios = ScenarioRepository().find_all()
+    except Exception as e:
+        logger.warning(f"Failed to fetch scenarios: {e}")
+        return json.dumps({"error": "无法获取场景列表"}, ensure_ascii=False)
+
+    result = []
+    for s in scenarios:
+        result.append({
+            "scenario_id": s.scenario_id or "",
+            "name": s.name or "未命名",
+            "scenario_type": s.scenario_type or "",
+            "state": s.state or "",
+        })
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _dispatch_tool_call(name: str, args: dict) -> str:
+    handlers = {
+        "list_execution_servers": _handle_list_execution_servers,
+        "list_human_servers": _handle_list_human_servers,
+        "list_scenarios": _handle_list_scenarios,
+    }
+    handler = handlers.get(name)
+    if not handler:
+        return json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False)
+    return handler()
+
+
+def _react_loop(messages: List[Dict], tools: List[Dict]) -> Optional[str]:
+    """ReAct loop: LLM 可调用 tool 获取数据，最终返回文本回复。"""
+    content = ""
+    for _ in range(_MAX_REACT_ITERATIONS):
+        response = llm_client.chat_with_tools(messages, tools, temperature=0.7)
+        if response is None:
+            return None
+
+        content = response.get("content", "") or ""
+        tool_calls = response.get("tool_calls")
+
+        assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
+        if tool_calls:
+            assistant_msg["tool_calls"] = tool_calls
+        messages.append(assistant_msg)
+
+        if not tool_calls:
+            return content
+
+        for tc in tool_calls:
+            fn_name = tc["function"]["name"]
+            try:
+                fn_args = json.loads(tc["function"]["arguments"])
+            except (json.JSONDecodeError, KeyError):
+                fn_args = {}
+            tool_output = _dispatch_tool_call(fn_name, fn_args)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": tool_output,
+            })
+
+    return content or "（达到最大工具调用轮次，请重试）"
 
 
 def get_known_server_ids() -> set:
     """返回所有已注册的服务器 ID 集合（用于校验 scene-spec 中的 server_id）。"""
-    import os
-    import requests
-
-    ws_url = os.getenv("WS_SERVER_API_URL", "https://agent-socket-server.bdzz.com.cn:8765")
     try:
-        resp = requests.get(f"{ws_url}/api/servers", timeout=5, verify=False)
-        resp.raise_for_status()
-        data = resp.json()
-        return {s["server_id"] for s in data.get("servers", []) if s.get("server_id")}
-    except Exception:
+        exec_data = json.loads(_handle_list_execution_servers())
+        human_data = json.loads(_handle_list_human_servers())
+    except (json.JSONDecodeError, TypeError):
         return set()
+    ids = set()
+    for s in (exec_data if isinstance(exec_data, list) else []):
+        if s.get("server_id"):
+            ids.add(s["server_id"])
+    for s in (human_data if isinstance(human_data, list) else []):
+        if s.get("server_id"):
+            ids.add(s["server_id"])
+    return ids
 
 
 def summarize_scenario(scenario_id: str) -> str:
@@ -366,10 +445,16 @@ def load_scenario_spec(scenario_id: str) -> Optional[Dict[str, Any]]:
 
 _SYSTEM_PROMPT = """你是一个「场景管理助手」，服务于 Agent Server Platform。你有两种能力：
 
+## 工具调用规则（必须遵守）
+1. 回答任何关于场景的问题前，必须先调用 `list_scenarios` 获取最新列表。
+2. 创建或修改场景时，必须先调用 `list_execution_servers` 获取可用服务器。
+3. `server_id` 只能从工具返回结果中选取，**严禁自行编造任何 server_id**。
+4. 如果工具返回空列表，告知用户当前没有可用服务器，不要尝试猜测。
+
 ## 1. 管理已有场景
 用户可能问"有哪些场景""进行中的场景""总结场景 X 的对话历史""查看场景配置"等。
-- 场景清单见下方【场景清单】。
-- 若需总结某个场景的对话历史，下方【场景聚焦】会给出该场景的时间线文本；请基于它做简洁中文总结（关键派发目标、各角色回复要点、当前进展/状态）。
+- 调用 `list_scenarios` 工具获取当前场景清单。
+- 若需总结某个场景的对话历史，【场景聚焦】会给出该场景的时间线文本；请基于它做简洁中文总结（关键派发目标、各角色回复要点、当前进展/状态）。
 - 若用户给的是场景 id 前缀但【场景聚焦】为空，提示用户确认 id。
 - **查看场景配置时**：使用普通 JSON 格式展示配置，**不要使用 scene-spec 代码块**。
 
@@ -393,11 +478,11 @@ config 形状：
 
 **执行 Agent（execution_agents）— 必填，至少 1 个**：
 - 每个执行 Agent 代表一个角色，由调度 Agent 分配子任务。
-- **⚠️ 必须为每个执行 Agent 分配 `server_id`**：若【可用执行 Agent 服务器】列表非空，你**必须**为每个执行 Agent 指定一个 `server_id`，确保任务在真实服务器上执行。仅当列表为空时才省略 `server_id`。
-- `server_id` 必须严格使用【可用执行 Agent 服务器】列表中列出的 server_id，逐字复制，不得自行编造、猜测或简化。
+- **⚠️ 必须为每个执行 Agent 分配 `server_id`**：创建场景前**必须先调用 `list_execution_servers` 工具**获取可用服务器列表，然后从中选择 `server_id`。
+- `server_id` 必须严格使用工具返回的 server_id，逐字复制，不得自行编造、猜测或简化。
 - 分配原则：根据 Agent 的角色和专长，选择最合适的服务器。若只有一个可用服务器，所有 Agent 都使用它；若有多个，根据角色合理分配。
-- `server_id` 可以指向 **人工 Agent 服务器**（source='human_agent'），这样该角色的任务会路由给真人操作者处理。
-- 示例：`{"name": "计算专家", "role": "擅长数学计算与逻辑推理", "server_id": "exec-server-1"}`
+- `server_id` 可以指向 **人工 Agent 服务器**（通过 `list_human_servers` 工具查询），这样该角色的任务会路由给真人操作者处理。
+- 示例：`{"name": "计算专家", "role": "擅长数学计算与逻辑推理", "server_id": "<从工具返回列表中选择>"}`
 - 若用户要求某角色由人工处理，将该角色的 `server_id` 设为对应的人工 Agent 服务器即可，**不需要单独的 human_agents 配置**。
 
 **关于人工验收（manual_acceptance）**：
@@ -422,17 +507,21 @@ config 形状：
 - 系统会在你回复前，把该场景的**全量当前配置**载入【当前草稿】。你**必须基于该全量草稿做修改**，并在回复末尾附上修改后的**完整** scene-spec（不要只给增量、不要丢字段），以保证配置不丢失。
 - 仅 `initializing` 状态的场景可修改；其它状态系统会拒绝并提示，你据实转告用户即可。
 - 修改与创建用的是同一套 scene-spec 格式；不要拒绝修改请求。
-- 用中文回复，简洁友好。"""
+- 用中文回复，简洁友好。
+
+## 可用工具（调用后方可回答）
+- `list_execution_servers`：查询可用的执行 Agent 服务器。**创建场景前必须调用，不可跳过**。
+- `list_human_servers`：查询可用的人工 Agent 服务器。需要路由给人工时调用。
+- `list_scenarios`：查询当前所有场景列表。**回答场景相关问题前必须调用**。
+
+⚠️ 不要凭记忆或猜测回答服务器和场景信息，必须先调用工具获取实时数据。"""
 
 
 def _build_messages(user_text: str, history: List[Dict[str, Any]],
                     pending_scene: Optional[Dict[str, Any]],
                     summary_content: Optional[str] = None) -> List[Dict[str, str]]:
-    """组装 LLM messages：system（含场景清单/聚焦/当前草稿）+ 历史 + 当前输入。"""
+    """组装 LLM messages：system（含聚焦/当前草稿）+ 历史 + 当前输入。"""
     sys = _SYSTEM_PROMPT
-    sys += "\n\n【场景清单】\n" + gather_scene_index()
-    sys += "\n\n【可用执行 Agent 服务器】\n" + gather_execution_servers()
-    sys += "\n\n【可用人工 Agent 服务器】\n" + gather_human_servers()
 
     # 若用户输入疑似指向某场景 id，注入聚焦上下文
     focus = _maybe_focus(user_text)
@@ -560,7 +649,7 @@ def reply(user_text: str, history: List[Dict[str, Any]],
             new_saved_id = target
 
     messages = _build_messages(user_text, history, new_pending, summary_content)
-    raw = llm_client.chat(messages, 0.7)
+    raw = _react_loop(messages, TOOLS)
     if not raw:
         return "（助手暂时没有响应，请重试。）", new_pending, render_preview(new_pending), new_saved_id
 
@@ -596,7 +685,7 @@ class SceneAssistant:
         pending_scene = self._repo.find_pending_scene(session_id)
         messages = _build_messages(user_text, history or [], pending_scene,
                                    summary_content)
-        return self._llm.chat(messages)
+        return _react_loop(messages, TOOLS) or ""
 
 
 # ── 自检 ───────────────────────────────────────────────────────────────────
