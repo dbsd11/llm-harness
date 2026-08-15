@@ -7,7 +7,7 @@ from core.llm_client import llm_client
 from core.event_bus import event_bus
 from logger import logger
 
-_MAX_REACT_ITERATIONS = 10
+_MAX_REACT_ITERATIONS = 20
 _DEFAULT_CMD_TIMEOUT = 30
 
 BASH_TOOL = {
@@ -240,7 +240,7 @@ class ExecutionAgent(BaseAgent):
             "【文件输出】\n"
             "- 所有生成的文件必须保存到 /data 目录，禁止保存到 /tmp 或 /app\n"
             "- 在最终回答中列出所有生成文件的完整路径\n\n"
-            "【工具额度】最多 10 次 run_bash 调用，收集够信息后直接给出完整答案。\n"
+            "【工具额度】最多 20 次 run_bash 调用，收集够信息后直接给出完整答案。\n"
         )
 
         # ── Dynamic per-task content (breaks prefix cache, placed at end) ──
@@ -275,7 +275,15 @@ class ExecutionAgent(BaseAgent):
             messages.append(assistant_msg)
 
             if not tool_calls:
-                final_text = content
+                if len(content) < 200 and iteration > 0:
+                    logger.warning(
+                        f"ReAct loop: model produced short response "
+                        f"({len(content)} chars) at iteration {iteration + 1} "
+                        f"for task {task_id}, synthesizing from context"
+                    )
+                    final_text = self._synthesize_final_answer(messages, task_id)
+                else:
+                    final_text = content
                 logger.info(
                     f"ReAct loop ended after {iteration + 1} iteration(s) "
                     f"for task {task_id}"
@@ -319,12 +327,14 @@ class ExecutionAgent(BaseAgent):
         all the context gathered during the ReAct loop."""
         synthesis_prompt = (
             "你已经达到了工具调用次数上限。请基于以上对话中收集到的所有信息，"
-            "直接生成完整的最终答案来回答用户的任务。不要再调用任何工具。\n\n"
-            "要求：\n"
-            "1. 综合所有已获取的信息，给出完整、有条理的回答\n"
-            "2. 如果某些信息缺失，基于已有内容尽力回答，标注不确定的部分\n"
-            "3. 如果生成了文件，列出文件路径\n"
-            "4. 直接输出最终答案，不要解释为什么停止"
+            "直接生成完整的最终答案。\n\n"
+            "【严格要求】\n"
+            "1. 直接输出完整的回答内容，禁止使用\"基于已收集的信息\"、\"我将生成\"、"
+            "\"现在给出\"等元描述语句开头\n"
+            "2. 回复长度不得少于 500 字，必须包含实质性的分析内容\n"
+            "3. 综合所有已获取的工具执行结果，给出完整、有条理的回答\n"
+            "4. 如果生成了文件，列出文件路径\n"
+            "5. 不要解释为什么停止，不要描述你要做什么——直接做"
         )
         synthesis_messages = messages + [
             {"role": "user", "content": synthesis_prompt},
@@ -333,12 +343,16 @@ class ExecutionAgent(BaseAgent):
         try:
             response = llm_client.chat_with_tools(synthesis_messages, [], temperature=0.3)
             content = response.get("content", "") if response else ""
-            if content:
+            if content and len(content) >= 200:
                 logger.info(
                     f"Synthesized final answer ({len(content)} chars) "
                     f"for task {task_id}"
                 )
                 return content
+            logger.warning(
+                f"Synthesized answer too short ({len(content) if content else 0} chars) "
+                f"for task {task_id}, using fallback"
+            )
         except Exception as e:
             logger.error(f"Failed to synthesize final answer for {task_id}: {e}")
 
@@ -356,7 +370,7 @@ class ExecutionAgent(BaseAgent):
 
         parts = ["[注意：达到工具调用次数上限，以下为已收集到的部分结果]\n\n"]
         for i, output in enumerate(tool_outputs, 1):
-            truncated = output[:500] + "..." if len(output) > 500 else output
+            truncated = output[:2000] + "..." if len(output) > 2000 else output
             parts.append(f"--- 步骤 {i} 结果 ---\n{truncated}\n")
         return "\n".join(parts)
 
