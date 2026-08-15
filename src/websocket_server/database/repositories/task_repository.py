@@ -205,8 +205,11 @@ class TaskRepository(BaseRepository[Task]):
                 conn.rollback()
                 return False
 
-    def mark_as_failed(self, task_id: str, error: str) -> bool:
-        """Mark task as failed
+    def mark_as_failed(self, task_id: str, error: str,
+                       result: str = None, agent_name: str = None,
+                       agent_role: str = None,
+                       execution_duration: float = None) -> bool:
+        """Mark task as failed, preserving the agent's output in `result`.
 
         使用事务确保原子性，防止竞态条件导致状态不一致。
         SQLite 使用 BEGIN IMMEDIATE 获取写锁，MySQL 使用 SELECT FOR UPDATE。
@@ -259,15 +262,25 @@ class TaskRepository(BaseRepository[Task]):
                 if db_engine == 'mysql':
                     cursor.execute(f"""
                         UPDATE {self.table_name}
-                        SET state = %s, error = %s, completed_at = %s, updated_at = %s
+                        SET state = %s, error = %s, result = %s,
+                            agent_name = %s, agent_role = %s,
+                            execution_duration = %s,
+                            completed_at = %s, updated_at = %s
                         WHERE task_id = %s
-                    """, ("failed", error, now, now, task_id))
+                    """, ("failed", error, result,
+                          agent_name, agent_role, execution_duration,
+                          now, now, task_id))
                 else:
                     cursor.execute(f"""
                         UPDATE {self.table_name}
-                        SET state = ?, error = ?, completed_at = ?, updated_at = ?
+                        SET state = ?, error = ?, result = ?,
+                            agent_name = ?, agent_role = ?,
+                            execution_duration = ?,
+                            completed_at = ?, updated_at = ?
                         WHERE task_id = ?
-                    """, ("failed", error, now, now, task_id))
+                    """, ("failed", error, result,
+                          agent_name, agent_role, execution_duration,
+                          now, now, task_id))
 
                 conn.commit()
                 return True

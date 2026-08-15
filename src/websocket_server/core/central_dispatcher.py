@@ -100,7 +100,12 @@ def finalize_task(scenario_id: Optional[str], task_id: str, result: dict,
                     execution_duration=execution_duration,
                 )
             else:
-                task_repo.mark_as_failed(task_id, result.get("error", "Unknown"))
+                task_repo.mark_as_failed(
+                    task_id, result.get("error", "Unknown"),
+                    result=json.dumps(result, ensure_ascii=False),
+                    agent_name=agent_name, agent_role=agent_role,
+                    execution_duration=execution_duration,
+                )
         except Exception as e:
             logger.error(f"[Dispatcher] Failed to update task state for {task_id}: {e}")
 
