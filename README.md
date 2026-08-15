@@ -4,7 +4,7 @@ A unified, distributed agent-server platform for multi-agent orchestration.
 Three peers collaborate over WebSocket/HTTP:
 
 - a **websocket_server** (core backend: REST API + WS hub + scheduling/scenario engine + workflow DAG engine + scene assistant + JWT auth + multi-tenant isolation + event broadcast),
-- an **agent_server_platform** (presentation layer: Gradio UI + event sync + human-agent relay), and
+- an **agent_server_platform** (presentation layer: Gradio UI + Flask internal API + event sync + human-agent relay), and
 - one or more **execution_agent_server** (sandboxed LLM task runners).
 
 ## System Architecture
@@ -15,7 +15,7 @@ Three peers collaborate over WebSocket/HTTP:
 │                                                                      │
 │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌───────────┐  │
 │  │Scheduling    │ │Scenario      │ │SceneAssistant│ │REST API   │  │
-│  │Agent         │ │Manager       │ │(chatbot +    │ │33 endpoints│  │
+│  │Agent         │ │Manager       │ │(chatbot +    │ │38 endpoints│  │
 │  │decompose+    │ │create+start+ │ │workflow mgmt)│ │scenarios,  │  │
 │  │dispatch      │ │stop+review   │ │              │ │tasks,agents│  │
 │  └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ │workflows…  │  │
@@ -40,7 +40,7 @@ Three peers collaborate over WebSocket/HTTP:
                  REST (8765) + WS /subscribe
                            │
 ┌──────────────────────────┴──────────────────────────────────────────┐
-│  agent_server_platform (presentation layer, Gradio :8080)            │
+│  agent_server_platform (presentation layer, Gradio :8080 + Flask :5000)│
 │                                                                      │
 │  ┌────────────────────┐  ┌──────────────────┐  ┌────────────────┐   │
 │  │ Gradio UI          │  │ HumanAgentClient │  │WSEventSubscriber│   │
@@ -58,8 +58,10 @@ Three peers collaborate over WebSocket/HTTP:
 │  │ ws_server REST     │           │                      │            │
 │  └────────────────────┘           │                      │            │
 │                                    │                      │            │
-│  Local DB: events, messages,       │                      │            │
-│  human_tasks tables                │                      │            │
+│  ┌──────────────────┐  Local DB: events, messages,       │            │
+│  │Flask Internal API│  human_tasks tables (SQLite)       │            │
+│  │ :5000 (Swagger)  │                                    │            │
+│  └──────────────────┘                                    │            │
 └────────────────────────────────────┼──────────────────────┼──────────┘
                                      │                      │
                            WS / (agent protocol)           │
@@ -288,6 +290,7 @@ llm-harness/
 │   └── deploy/                    # deploy.sh per component + TLS cert management
 ├── docs/
 │   ├── WEBSOCKET_SERVER_API_KEY_AUTH_DESIGN.md
+│   ├── asp-scenario-assistant-design.md
 │   └── workflow-system-design.md
 ├── README.md
 └── .gitignore
@@ -297,8 +300,8 @@ llm-harness/
 
 | Component | Path | Role | Port |
 |---|---|---|---|
-| **websocket_server** | `src/websocket_server/` | **Core backend**: 12 DB tables, JWT auth, multi-tenant isolation, SchedulingAgent, ScenarioManager, SceneAssistant, WorkflowPublisher/Executor, CentralDispatcher, REST API (33 endpoints), WS hub, event broadcast | 8765 (WS + REST) |
-| **agent_server_platform** | `src/agent_server_platform/` | **Presentation layer**: Gradio UI (Dashboard, Scenario Dashboard, Workflow DAG, Task Monitor, Agent Registry, Execution Servers, Human Tasks, Event Log), HumanAgentClient, WSEventSubscriber, api_client | 8080 (Gradio) |
+| **websocket_server** | `src/websocket_server/` | **Core backend**: 12 DB tables, JWT auth, multi-tenant isolation, SchedulingAgent, ScenarioManager, SceneAssistant, WorkflowPublisher/Executor, CentralDispatcher, REST API (38 endpoints), WS hub, event broadcast | 8765 (WS + REST) |
+| **agent_server_platform** | `src/agent_server_platform/` | **Presentation layer**: Gradio UI (Dashboard, Scenario Dashboard, Workflow DAG, Task Monitor, Agent Registry, Execution Servers, Human Tasks, Event Log), Flask internal API (:5000 with Swagger), HumanAgentClient, WSEventSubscriber, api_client | 8080 (Gradio) + 5000 (Flask) |
 | **execution_agent_server** | `src/execution_agent_server/` | Sandboxed LLM task runner; connects to WS server, executes TASK frames | - (outbound WS) |
 
 ## Quick Start
@@ -316,10 +319,11 @@ cp .env.example .env
 pip install -r requirements.txt
 python -m execution_server
 
-# 3. Agent server platform (presentation) — Gradio UI
+# 3. Agent server platform (presentation) — Gradio :8080 + Flask :5000
 cd src/agent_server_platform
 cp .env.example .env
-python src/app.py
+pip install -r requirements.txt
+python src/app.py --all
 ```
 
 ## Deployment (Docker)
@@ -337,18 +341,71 @@ bash scripts/deploy/agent_server_platform.sh
 
 ## Configuration
 
-| Var | Set in | Meaning |
+Each component has its own `.env` file (copy from `.env.example`).
+
+### websocket_server
+
+| Var | Default | Meaning |
 |---|---|---|
-| `WS_JWT_SECRET` | ws_server `.env` | JWT signing key for API Key verification (must match platform) |
-| `WS_TENANT_STRICT` | ws_server `.env` | `true` = strict tenant isolation, `false` = backward-compatible (default) |
-| `WS_SSL_CERT` / `WS_SSL_KEY` | ws_server `.env` | TLS certificate/key paths (enables WSS+HTTPS on single port) |
-| `WS_SERVER_API_URL` | platform `.env` | HTTP base for ws_server REST API (e.g. `https://host:8765`) |
-| `WS_SERVER_WS_URL` | platform `.env` | WS URL for HumanAgentClient and WSEventSubscriber (e.g. `wss://host:8765`) |
-| `DASHSCOPE_API_KEY` | platform + ws_server `.env` | LLM API key (both need it: platform for compression, ws_server for chat/scheduling) |
-| `LLM_BASE_URL` | platform + ws_server `.env` | LLM API base URL |
-| `LLM_MODEL` | platform + ws_server `.env` | LLM model name (e.g. `qwen3.7-plus`) |
-| `SANDBOX_SSH_HOST` | platform `.env` | SSH host for Docker sandbox management |
-| `SANDBOX_DOCKER_IMAGE` | platform `.env` | Docker image for sandbox containers |
+| `WS_HOST` | `0.0.0.0` | Bind address |
+| `WS_PORT` | `8765` | WS + REST listen port |
+| `HEARTBEAT_INTERVAL` | `5` | Agent heartbeat interval (seconds) |
+| `HEARTBEAT_TIMEOUT` | `15` | Agent heartbeat timeout (seconds) |
+| `WS_SSL_CERT` / `WS_SSL_KEY` | — | TLS cert/key paths (enables WSS+HTTPS on single port) |
+| `WS_JWT_SECRET` | `ws-platform-jwt-secret-2026` | HMAC-SHA256 signing key (must match platform) |
+| `WS_TENANT_STRICT` | `false` | `true` = strict tenant isolation, `false` = backward-compatible |
+| `DB_ENGINE` | `mysql` | Database engine (`mysql`, `sqlite`, `postgresql`) |
+| `DB_HOST` / `DB_PORT` | `localhost` / `3306` | Database host and port |
+| `DB_NAME` | — | Database name |
+| `DB_USER` / `DB_PASSWORD` | — | Database credentials |
+| `DASHSCOPE_API_KEY` | — | LLM API key (chat/scheduling) |
+| `LLM_BASE_URL` | — | LLM API base URL |
+| `LLM_MODEL` | — | LLM model name (e.g. `qwen3.7-plus`) |
+| `LLM_MAX_TOKENS` | — | Max tokens per LLM call |
+| `LLM_ENABLE_THINKING` | — | Enable thinking mode |
+| `LLM_TIMEOUT` | — | LLM request timeout (seconds) |
+
+### agent_server_platform
+
+| Var | Default | Meaning |
+|---|---|---|
+| `GRADIO_HOST` / `GRADIO_PORT` | `0.0.0.0` / `8080` | Gradio UI bind address |
+| `FLASK_HOST` / `FLASK_PORT` | `0.0.0.0` / `5000` | Flask internal API bind address |
+| `AUTH_ENABLED` | — | Enable authentication |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | — | Admin backdoor credentials (emergency login) |
+| `WS_SERVER_API_URL` | — | HTTP base for ws_server REST API (e.g. `https://host:8765`) |
+| `WS_SERVER_WS_URL` | — | WS URL for HumanAgentClient and WSEventSubscriber (e.g. `wss://host:8765`) |
+| `DB_ENGINE` | `sqlite` | Local database engine (default: SQLite) |
+| `DB_NAME` | `agent_server.db` | Local database file/name |
+| `DB_MAX_CONNECTIONS` | — | Connection pool max size |
+| `DB_MIN_CONNECTIONS` | — | Connection pool min size |
+| `DB_TIMEOUT` | — | Connection pool timeout |
+| `DASHSCOPE_API_KEY` | — | LLM API key (compression, local exec) |
+| `LLM_BASE_URL` / `LLM_MODEL` | — | LLM API config |
+| `LLM_MAX_TOKENS` / `LLM_ENABLE_THINKING` / `LLM_TIMEOUT` | — | LLM tuning |
+| `HUMAN_AGENT_QUOTA` | — | Max concurrent human agent tasks |
+| `HUMAN_WS_PORT` | — | Human agent browser WebSocket port |
+| `SANDBOX_SSH_HOST` | — | SSH host for Docker sandbox management |
+| `SANDBOX_DOCKER_IMAGE` | — | Docker image for sandbox containers |
+| `SANDBOX_TIMEOUT` / `SANDBOX_MAX_OUTPUT_SIZE` | — | Sandbox limits |
+| `WATCHDOG_CHECK_INTERVAL` | — | Watchdog check interval (seconds) |
+| `WATCHDOG_DEFAULT_TIMEOUT` | — | Watchdog default timeout |
+| `LOG_LEVEL` / `LOG_FORMAT` | — | Logging config |
+
+### execution_agent_server
+
+| Var | Default | Meaning |
+|---|---|---|
+| `SERVER_ID` | — | Unique server identifier |
+| `SERVER_NAME` | — | Display name |
+| `MAX_QUOTA` | — | Max concurrent tasks |
+| `BACKEND_WS_URL` | — | ws_server WS URL to connect to |
+| `HEARTBEAT_INTERVAL` | `5` | Heartbeat interval (seconds) |
+| `DASHSCOPE_API_KEY` | — | LLM API key |
+| `LLM_BASE_URL` / `LLM_MODEL` | — | LLM API config |
+| `LLM_MAX_TOKENS` / `LLM_ENABLE_THINKING` / `LLM_TIMEOUT` | — | LLM tuning |
+| `DB_ENGINE` / `DB_NAME` | — | Local database config (events/messages) |
+| `LOG_LEVEL` / `LOG_FORMAT` | — | Logging config |
 
 ## ws_server REST API
 
