@@ -71,8 +71,21 @@ class ConnectionManager:
             pool_size = int(os.getenv("SQLITE_POOL_SIZE",
                                       os.getenv("DB_THREAD_POOL_SIZE", "10")))
 
+            # ponytail: 用工厂函数代替直接传 sqlite3，确保每个连接都带 row_factory。
+            # PooledDB 的 setsession 只接受 SQL 字符串，无法设置 Python 属性。
+            # 直接传 creator=sqlite3 只有初始化时那个连接有 row_factory，
+            # 后续新开的连接返回 tuple 而非 Row，导致所有 repository 的 row["key"] 崩溃。
+            def _make_sqlite_conn():
+                conn = sqlite3.connect(
+                    database=db_path,
+                    check_same_thread=False,
+                    timeout=5,
+                )
+                conn.row_factory = sqlite3.Row
+                return conn
+
             pool = PooledDB(
-                creator=sqlite3,
+                creator=_make_sqlite_conn,
                 maxconnections=pool_size,
                 mincached=1,
                 blocking=True,
@@ -83,17 +96,7 @@ class ConnectionManager:
                     "PRAGMA synchronous=NORMAL",
                 ],
                 ping=0,
-                database=db_path,
-                check_same_thread=False,
-                timeout=5,
             )
-
-            # 初始化后立即取一次连接以设置 row_factory（PooledDB 的 setsession
-            # 只接受 SQL 字符串，row_factory 需要通过 Python 赋值）。后续从池中
-            # 取出的连接已是同一对象，row_factory 随之生效。
-            init_conn = pool.connection()
-            init_conn.row_factory = sqlite3.Row
-            init_conn.close()  # 归还到池中，而非真正关闭
 
             logger.info(f"创建SQLite连接池成功: {db_path} (pool_size={pool_size})")
             return pool
