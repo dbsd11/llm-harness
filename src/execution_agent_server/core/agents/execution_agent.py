@@ -251,7 +251,15 @@ class ExecutionAgent(BaseAgent):
         if server_id:
             system_msg += f"\n\n【执行环境】服务器 ID：`{server_id}`"
         if upstream:
-            system_msg += "\n\n【前序任务输出】\n" + "\n---\n".join(upstream)
+            system_msg += "\n\n【前序任务输出（摘要）】\n"
+            system_msg += "（以下为前序任务输出的前 5000 字符摘要，完整内容可用 cat 从 /data 目录读取）\n"
+            truncated = []
+            for i, out in enumerate(upstream):
+                snippet = out[:5000]
+                if len(out) > 5000:
+                    snippet += f"\n... [截断，原文 {len(out)} 字符]"
+                truncated.append(snippet)
+            system_msg += "\n---\n".join(truncated)
 
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_msg},

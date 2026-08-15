@@ -19,7 +19,7 @@ class LLMClient:
         self.model = os.getenv("LLM_MODEL", "qwen-plus")
         self.max_tokens = int(os.getenv("LLM_MAX_TOKENS", "65535"))
         self.enable_thinking = os.getenv("LLM_ENABLE_THINKING", "true").lower() == "true"
-        self.timeout = int(os.getenv("LLM_TIMEOUT", "120"))  # 默认 120 秒超时
+        self.timeout = int(os.getenv("LLM_TIMEOUT", "300"))  # 默认 300 秒超时
 
         if not self.api_key:
             logger.warning("DASHSCOPE_API_KEY not configured, LLM features disabled")
