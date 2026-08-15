@@ -183,13 +183,34 @@ class ExecutionAgent(BaseAgent):
 
         Score >= 80 → success. Below 80 → failure.
 
+        If the agent output references files in /data, those files are read
+        from disk and included in the judgment so the agent isn't penalized
+        for saving to a file instead of inlining the content.
+
         Returns:
             (success: bool, error_msg: str or None)
         """
+        import re
+
+        eval_output = output
+        file_paths = re.findall(r'/data/[\w\-./]+\.md', output)
+        file_contents = []
+        for path in dict.fromkeys(file_paths):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                file_contents.append(f"--- {path} ({len(content)} chars) ---\n{content[:8000]}")
+                logger.info(f"Judge reading saved file {path} ({len(content)} chars)")
+            except Exception as e:
+                logger.debug(f"Judge could not read {path}: {e}")
+
+        if file_contents:
+            eval_output = output + "\n\n【已保存文件内容】\n" + "\n\n".join(file_contents)
+
         judge_prompt = (
             "你是一个任务执行结果评判员。请对 Agent 的输出与任务目标的相关性和完成度打分（0-100）。\n\n"
             f"【任务目标】\n{goal}\n\n"
-            f"【Agent 输出】\n{output[:8000]}\n\n"
+            f"【Agent 输出】\n{eval_output[:12000]}\n\n"
             "【评分维度】\n"
             "1. 目标覆盖度（40分）：输出是否涵盖了任务目标要求的主要内容\n"
             "2. 实际执行证据（30分）：输出是否包含实际执行命令的结果（如 git clone 输出、文件内容、命令输出等）\n"
@@ -203,9 +224,8 @@ class ExecutionAgent(BaseAgent):
             "【注意】\n"
             "- 不要因为个别版本号、日期等细节无法验证就大幅扣分\n"
             "- 重点关注输出是否实际回应了任务目标的核心需求\n"
-            "- 如果 Agent 实际执行了命令（如 git clone）并基于结果生成了报告，即使部分细节有偏差，也应给较高分\n"
-            "- 如果任务要求生成文件并保存到 /data，Agent 将文件保存并用 cat 输出了内容，应视为有效执行\n"
-            "- 如果 Agent 输出了结构化的报告内容（无论是否内联全文或保存为文件），且内容与任务目标高度相关，不应因'未内联全文'而大幅扣分\n\n"
+            "- 如果 Agent 实际执行了命令并基于结果生成了报告，即使部分细节有偏差，也应给较高分\n"
+            "- 如果 Agent 将报告保存到 /data 文件且文件内容完整，应视为有效执行，不因'未内联全文'扣分\n\n"
             "请严格按以下 JSON 格式回复，不要包含其他内容：\n"
             '{"score": 0-100, "reason": "简短评分理由"}'
         )
@@ -266,7 +286,8 @@ class ExecutionAgent(BaseAgent):
             "5. 宁可报告任务未完成，也不要生成基于猜测的虚假结果\n\n"
             "【文件输出】\n"
             "- 生成的文件保存到 /data 目录\n"
-            "- 保存后用 cat 读取文件内容，将完整内容包含在最终回答中\n\n"
+            "- 在最终回答中列出保存的文件路径，并包含内容摘要或关键发现\n"
+            "- 不需要用 cat 回显完整文件内容，评判系统会自动读取已保存的文件\n\n"
             "【信息检索】\n"
             "- 使用 grep -n '关键词' /data/upstream/*.md 检索前序任务输出中的关键信息\n"
             "- 使用 cat /data/upstream/task_N.md 读取完整的前序任务输出\n"
@@ -374,21 +395,22 @@ class ExecutionAgent(BaseAgent):
             {"role": "user", "content": synthesis_prompt},
         ]
 
-        try:
-            response = llm_client.chat_with_tools(synthesis_messages, [], temperature=0.3)
-            content = response.get("content", "") if response else ""
-            if content and len(content) >= 200:
-                logger.info(
-                    f"Synthesized final answer ({len(content)} chars) "
+        for attempt in range(2):
+            try:
+                content = llm_client.chat(synthesis_messages, temperature=0.3)
+                if content and len(content) >= 200:
+                    logger.info(
+                        f"Synthesized final answer ({len(content)} chars) "
+                        f"for task {task_id}"
+                    )
+                    return content
+                logger.warning(
+                    f"Synthesized answer too short "
+                    f"({len(content) if content else 0} chars, attempt {attempt + 1}) "
                     f"for task {task_id}"
                 )
-                return content
-            logger.warning(
-                f"Synthesized answer too short ({len(content) if content else 0} chars) "
-                f"for task {task_id}, using fallback"
-            )
-        except Exception as e:
-            logger.error(f"Failed to synthesize final answer for {task_id}: {e}")
+            except Exception as e:
+                logger.error(f"Failed to synthesize final answer for {task_id}: {e}")
 
         return self._build_fallback_summary(messages)
 
