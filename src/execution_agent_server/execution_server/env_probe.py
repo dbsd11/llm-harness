@@ -9,6 +9,7 @@ import subprocess
 COMMANDS = [
     "bash", "sh", "claude", "codex", "qwen",
     "curl", "wget", "ls", "mkdir", "cat", "sed", "python",
+    "git", "jq", "grep", "find", "tar", "pip",
 ]
 
 # Host facts reported alongside the command list.
