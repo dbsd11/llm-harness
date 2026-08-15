@@ -21,7 +21,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
+/build/
 develop-eggs/
 dist/
 downloads/
@@ -75,6 +75,11 @@ logs/
 
 # ── Tool workspaces ──────────────────────────────────────────────────────────
 .hiclaw-workspace/
+
+# ── Build scripts with credentials ──────────────────────────────────────────
+scripts/build/execution_agent_server/remote_build_and_test.py
+scripts/build/execution_agent_server/test_execution_agent_container.py
+scripts/build/execution_agent_server/check_build_error.py
 
 # ── Node (if any frontend tooling is added later) ────────────────────────────
 node_modules/

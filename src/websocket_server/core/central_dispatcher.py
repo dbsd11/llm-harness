@@ -51,35 +51,58 @@ def _scenario_requires_acceptance(scenario_id: Optional[str]) -> bool:
 
 def finalize_task(scenario_id: Optional[str], task_id: str, result: dict,
                   agent_name: str = None, agent_role: str = None,
-                  execution_duration: float = None) -> None:
+                  execution_duration: float = None,
+                  dispatch_retry_attempt: int = None) -> None:
     """Mark task state + write the reply Message row.
 
     Shared by both the local and the WS-forward execution paths so the reply
     wire format stays identical to the legacy ExecutionWorker. Stamps the
     execution-agent identity + duration onto the task row (the scheduling
     path does this in agent_manager; the execution path does it here).
+
+    If dispatch_retry_attempt is provided, compares against the task's current
+    retry_count to detect stale results from superseded executions.
     """
     task_repo = TaskRepository()
     msg_repo = MessageRepository()
-    manual = _scenario_requires_acceptance(scenario_id)
-    try:
-        if manual:
-            # Manual acceptance: route to PENDING_REVIEW for human review
-            task_repo.mark_as_pending_review(
-                task_id, json.dumps(result, ensure_ascii=False),
-                agent_name=agent_name, agent_role=agent_role,
-                execution_duration=execution_duration,
-            )
-        elif result.get("success"):
-            task_repo.mark_as_completed(
-                task_id, json.dumps(result, ensure_ascii=False),
-                agent_name=agent_name, agent_role=agent_role,
-                execution_duration=execution_duration,
-            )
-        else:
-            task_repo.mark_as_failed(task_id, result.get("error", "Unknown"))
-    except Exception as e:
-        logger.error(f"[Dispatcher] Failed to update task state for {task_id}: {e}")
+
+    # Stale-result guard: if this execution was dispatched with an older
+    # retry_attempt than the task's current retry_count, a newer retry has
+    # already superseded it.  Skip the state update but still write the reply
+    # so collect_replies can account for it.
+    stale = False
+    if dispatch_retry_attempt is not None:
+        try:
+            task = task_repo.find_by_task_id(task_id)
+            if task and (task.retry_count or 0) > dispatch_retry_attempt:
+                stale = True
+                logger.warning(
+                    f"[Dispatcher] Discarding stale result for task {task_id}: "
+                    f"dispatch generation={dispatch_retry_attempt}, "
+                    f"current retry_count={task.retry_count}"
+                )
+        except Exception as e:
+            logger.error(f"[Dispatcher] Failed to check retry_count for {task_id}: {e}")
+
+    if not stale:
+        manual = _scenario_requires_acceptance(scenario_id)
+        try:
+            if manual:
+                task_repo.mark_as_pending_review(
+                    task_id, json.dumps(result, ensure_ascii=False),
+                    agent_name=agent_name, agent_role=agent_role,
+                    execution_duration=execution_duration,
+                )
+            elif result.get("success"):
+                task_repo.mark_as_completed(
+                    task_id, json.dumps(result, ensure_ascii=False),
+                    agent_name=agent_name, agent_role=agent_role,
+                    execution_duration=execution_duration,
+                )
+            else:
+                task_repo.mark_as_failed(task_id, result.get("error", "Unknown"))
+        except Exception as e:
+            logger.error(f"[Dispatcher] Failed to update task state for {task_id}: {e}")
 
     try:
         msg_repo.create(Message(
@@ -91,7 +114,8 @@ def finalize_task(scenario_id: Optional[str], task_id: str, result: dict,
             content=json.dumps({
                 "task_id": task_id,
                 "success": result.get("success", False),
-                "pending_review": manual,
+                "pending_review": False if stale else _scenario_requires_acceptance(scenario_id),
+                "stale_generation": stale,
                 "result": result,
             }, ensure_ascii=False),
             timestamp=datetime.now(),
@@ -143,14 +167,15 @@ def run_task_locally(scenario_id: Optional[str], msg: TaskMessage) -> None:
         finalize_task(scenario_id, msg.task_id, result,
                       agent_name="ExecutionAgent",
                       agent_role=agent_config["role"],
-                      execution_duration=round(elapsed, 3))
+                      execution_duration=round(elapsed, 3),
+                      dispatch_retry_attempt=msg.context.get("retry_attempt"))
 
     except Exception as e:
         elapsed = time.time() - start_time
         logger.error(f"[Local] Task {msg.task_id} error after {elapsed:.2f}s: {e}")
         finalize_task(scenario_id, msg.task_id, {
             "success": False, "output": "", "error": str(e),
-        })
+        }, dispatch_retry_attempt=msg.context.get("retry_attempt"))
     finally:
         agent.cleanup()
 

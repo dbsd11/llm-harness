@@ -39,8 +39,12 @@ BASH_TOOL = {
 TOOLS = [BASH_TOOL]
 
 
-def _execute_bash(command: str, timeout: int = _DEFAULT_CMD_TIMEOUT) -> str:
-    """Run a shell command and return its combined output + exit code."""
+def _execute_bash(command: str, timeout: int = _DEFAULT_CMD_TIMEOUT) -> dict:
+    """Run a shell command and return structured result.
+
+    Returns:
+        dict with keys: output (str), exit_code (int), timed_out (bool)
+    """
     try:
         result = subprocess.run(
             command,
@@ -55,11 +59,23 @@ def _execute_bash(command: str, timeout: int = _DEFAULT_CMD_TIMEOUT) -> str:
             output += ("\n" if output else "") + result.stderr
         if result.returncode != 0:
             output += f"\n[exit code: {result.returncode}]"
-        return output.strip() or "(no output)"
+        return {
+            "output": output.strip() or "(no output)",
+            "exit_code": result.returncode,
+            "timed_out": False,
+        }
     except subprocess.TimeoutExpired:
-        return f"[error] command timed out after {timeout}s"
+        return {
+            "output": f"[error] command timed out after {timeout}s",
+            "exit_code": -1,
+            "timed_out": True,
+        }
     except Exception as e:
-        return f"[error] {e}"
+        return {
+            "output": f"[error] {e}",
+            "exit_code": -1,
+            "timed_out": False,
+        }
 
 
 class ExecutionAgent(BaseAgent):
@@ -97,20 +113,31 @@ class ExecutionAgent(BaseAgent):
             server_id = context.get("server_id", "")
             logger.info(f"ExecutionAgent (ReAct) processing: {question[:100]}...")
 
-            output = self._react_loop(task_id, question, upstream, server_id=server_id)
+            loop_result = self._react_loop(
+                task_id, question, upstream, server_id=server_id)
+            output = loop_result["output"]
+
+            success, error_msg = self._judge_task_success(
+                question, output, task_id)
 
             event_bus.emit("task.execution_completed", {
                 "task_id": task_id,
                 "role": self.role,
                 "response_length": len(output),
+                "success": success,
             })
 
-            return {
-                "success": True,
+            result = {
+                "success": success,
                 "output": output,
                 "role": self.role,
                 "question": question,
             }
+            if error_msg:
+                result["error"] = error_msg
+                logger.warning(f"Task {task_id} execution result: {error_msg}")
+
+            return result
 
         except Exception as e:
             error_msg = str(e)
@@ -125,9 +152,72 @@ class ExecutionAgent(BaseAgent):
                 "error": error_msg,
             }
 
+    def _judge_task_success(self, goal: str, output: str,
+                            task_id: str) -> tuple:
+        """Judge whether the task output is correct via LLM evaluation.
+
+        Only the final output correctness matters — tool call failures,
+        script errors, and intermediate failures do not determine success.
+
+        Returns:
+            (success: bool, error_msg: str or None)
+        """
+        judge_prompt = (
+            "你是一个任务执行结果评判员。请根据以下信息判断任务是否真正成功完成。\n\n"
+            f"【任务目标】\n{goal}\n\n"
+            f"【Agent 输出】\n{output[:3000]}\n\n"
+            "【评判标准】\n"
+            "1. 任务是否被实际执行（而非仅提供建议或命令示例）\n"
+            "2. 输出内容是否基于实际执行结果（而非推断、猜测或语义分析）\n"
+            "3. 是否明确承认无法完成任务（如缺少资源、权限不足、上下文不足等）\n"
+            "4. 输出是否包含明显的幻觉内容（如编造的数据、未实际获取的信息）\n\n"
+            "【判断规则】\n"
+            "- 如果 agent 承认无法获取所需资源但仍生成了基于推断的内容 → 失败\n"
+            "- 如果 agent 明确报告任务失败且未生成虚假内容 → 失败\n"
+            "- 如果 agent 实际执行了任务并返回了基于真实执行的结果 → 成功\n"
+            "- 如果输出包含\"无法完成任务\"、\"上下文不足\"、\"无法获取\"等明确表示失败的内容 → 失败\n\n"
+            "请严格按以下 JSON 格式回复，不要包含其他内容：\n"
+            '{"success": true/false, "reason": "简短判断理由"}'
+        )
+
+        try:
+            messages = [
+                {"role": "system", "content": "你是任务结果评判员，只输出 JSON。"},
+                {"role": "user", "content": judge_prompt},
+            ]
+            response = llm_client.chat(messages, temperature=0.1)
+            if response:
+                text = response.strip()
+                # Extract JSON from possible markdown wrapping
+                if "```" in text:
+                    text = text.split("```")[1]
+                    if text.startswith("json"):
+                        text = text[4:]
+                    text = text.strip()
+                judgment = json.loads(text)
+                success = judgment.get("success", True)
+                reason = judgment.get("reason", "")
+                logger.info(
+                    f"Task {task_id} LLM judgment: success={success}, "
+                    f"reason={reason}"
+                )
+                if not success:
+                    return False, f"结果评判为失败: {reason}"
+                return True, None
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Failed to parse LLM judgment for {task_id}: {e}")
+        except Exception as e:
+            logger.error(f"LLM judgment call failed for {task_id}: {e}")
+
+        return True, None
+
     def _react_loop(self, task_id: str, question: str,
-                    upstream: List[str], server_id: str = "") -> str:
-        """ReAct loop: reason -> act (tool) -> observe -> repeat."""
+                    upstream: List[str], server_id: str = "") -> dict:
+        """ReAct loop: reason -> act (tool) -> observe -> repeat.
+
+        Returns:
+            dict with key: output (str)
+        """
         system_msg = (
             f"{self.system_prompt}\n\n"
             "【核心任务】你必须使用 run_bash 工具在服务器 shell 中实际执行命令来完成目标。\n"
@@ -141,6 +231,12 @@ class ExecutionAgent(BaseAgent):
             "- 禁止只提供命令示例而不实际执行\n"
             "- 禁止只解释如何使用命令而不实际调用工具\n"
             "- 禁止说'我无法执行'或'建议使用以下命令'而不实际调用 run_bash\n\n"
+            "【反幻觉规则 - 必须严格遵守】\n"
+            "1. 你的回答必须严格基于实际执行结果，禁止凭推断、猜测或语义分析生成内容\n"
+            "2. 如果无法获取完成任务所需的资源（如代码仓库、文件、API 等），必须明确报告失败原因，如：\"无法完成任务：缺少 XXX 资源\"\n"
+            "3. 禁止在无法访问实际数据的情况下生成评审报告、分析结果或任何实质性内容\n"
+            "4. 如果上下文不足以生成准确的内容，回复类似\"上下文不足，无法完成任务\"的反馈\n"
+            "5. 宁可报告任务未完成，也不要生成基于猜测的虚假结果\n\n"
             "【文件输出约束】\n"
             "- /data 是持久化数据目录，任务中生成的所有文件必须保存到 /data 目录下\n"
             "- 不要将生成的文件保存到 /tmp、/app 或其他临时目录\n"
@@ -195,7 +291,8 @@ class ExecutionAgent(BaseAgent):
                     cmd = fn_args.get("command", "")
                     timeout = fn_args.get("timeout", _DEFAULT_CMD_TIMEOUT)
                     logger.info(f"ReAct executing bash: {cmd[:200]}")
-                    tool_output = _execute_bash(cmd, timeout)
+                    bash_result = _execute_bash(cmd, timeout)
+                    tool_output = bash_result["output"]
                     logger.info(f"ReAct bash output ({len(tool_output)} chars)")
                 else:
                     tool_output = f"[error] unknown tool: {fn_name}"
@@ -212,7 +309,7 @@ class ExecutionAgent(BaseAgent):
             )
             final_text = self._synthesize_final_answer(messages, task_id)
 
-        return final_text
+        return {"output": final_text}
 
     def _synthesize_final_answer(self, messages: List[Dict[str, Any]],
                                  task_id: str) -> str:

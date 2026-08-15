@@ -118,32 +118,164 @@ class TaskRepository(BaseRepository[Task]):
 
     def mark_as_completed(self, task_id: str, result: str = None, agent_name: str = None,
                           agent_role: str = None, execution_duration: float = None) -> bool:
-        """Mark task as completed with agent information"""
-        task = self.find_by_task_id(task_id)
-        if not task:
-            return False
-        task.state = "success"
-        task.result = result
-        task.completed_at = datetime.now()
-        task.updated_at = datetime.now()
-        if agent_name is not None:
-            task.agent_name = agent_name
-        if agent_role is not None:
-            task.agent_role = agent_role
-        if execution_duration is not None:
-            task.execution_duration = execution_duration
-        return self.update(task)
+        """Mark task as completed with agent information
+
+        使用事务确保原子性，防止竞态条件导致状态不一致。
+        SQLite 使用 BEGIN IMMEDIATE 获取写锁，MySQL 使用 SELECT FOR UPDATE。
+        """
+        import os
+        from database.connection import get_connection_manager
+
+        conn_mgr = get_connection_manager()
+        db_engine = os.getenv('DB_ENGINE', 'sqlite')
+
+        with conn_mgr.get_connection() as conn:
+            try:
+                cursor = conn.cursor()
+
+                # 根据数据库类型选择锁策略
+                if db_engine == 'mysql':
+                    # MySQL: 使用 SELECT FOR UPDATE
+                    cursor.execute(
+                        f"SELECT state FROM {self.table_name} WHERE task_id = %s FOR UPDATE",
+                        (task_id,)
+                    )
+                else:
+                    # SQLite: 使用 BEGIN IMMEDIATE 获取写锁
+                    cursor.execute("BEGIN IMMEDIATE")
+                    cursor.execute(
+                        f"SELECT state FROM {self.table_name} WHERE task_id = ?",
+                        (task_id,)
+                    )
+
+                row = cursor.fetchone()
+                if not row:
+                    if db_engine != 'mysql':
+                        conn.commit()
+                    return False
+
+                current_state = row['state'] if isinstance(row, dict) else row[0]
+
+                # 防止终态被覆盖（修复竞态条件）
+                if current_state in ['success', 'failed', 'timeout', 'cancelled']:
+                    logger.warning(
+                        f"Task {task_id} already in terminal state: {current_state}, "
+                        f"skipping mark_as_completed"
+                    )
+                    if db_engine != 'mysql':
+                        conn.commit()
+                    return False
+
+                # 更新任务状态
+                now = datetime.now()
+                if db_engine == 'mysql':
+                    cursor.execute(f"""
+                        UPDATE {self.table_name}
+                        SET state = %s, result = %s, error = NULL,
+                            completed_at = %s, updated_at = %s,
+                            agent_name = COALESCE(%s, agent_name),
+                            agent_role = COALESCE(%s, agent_role),
+                            execution_duration = COALESCE(%s, execution_duration)
+                        WHERE task_id = %s
+                    """, (
+                        "success", result, now, now,
+                        agent_name, agent_role, execution_duration,
+                        task_id
+                    ))
+                else:
+                    cursor.execute(f"""
+                        UPDATE {self.table_name}
+                        SET state = ?, result = ?, error = NULL,
+                            completed_at = ?, updated_at = ?,
+                            agent_name = COALESCE(?, agent_name),
+                            agent_role = COALESCE(?, agent_role),
+                            execution_duration = COALESCE(?, execution_duration)
+                        WHERE task_id = ?
+                    """, (
+                        "success", result, now, now,
+                        agent_name, agent_role, execution_duration,
+                        task_id
+                    ))
+
+                conn.commit()
+                return True
+
+            except Exception as e:
+                logger.error(f"mark_as_completed failed for {task_id}: {e}")
+                conn.rollback()
+                return False
 
     def mark_as_failed(self, task_id: str, error: str) -> bool:
-        """Mark task as failed"""
-        task = self.find_by_task_id(task_id)
-        if not task:
-            return False
-        task.state = "failed"
-        task.error = error
-        task.completed_at = datetime.now()
-        task.updated_at = datetime.now()
-        return self.update(task)
+        """Mark task as failed
+
+        使用事务确保原子性，防止竞态条件导致状态不一致。
+        SQLite 使用 BEGIN IMMEDIATE 获取写锁，MySQL 使用 SELECT FOR UPDATE。
+        """
+        import os
+        from database.connection import get_connection_manager
+
+        conn_mgr = get_connection_manager()
+        db_engine = os.getenv('DB_ENGINE', 'sqlite')
+
+        with conn_mgr.get_connection() as conn:
+            try:
+                cursor = conn.cursor()
+
+                # 根据数据库类型选择锁策略
+                if db_engine == 'mysql':
+                    # MySQL: 使用 SELECT FOR UPDATE
+                    cursor.execute(
+                        f"SELECT state FROM {self.table_name} WHERE task_id = %s FOR UPDATE",
+                        (task_id,)
+                    )
+                else:
+                    # SQLite: 使用 BEGIN IMMEDIATE 获取写锁
+                    cursor.execute("BEGIN IMMEDIATE")
+                    cursor.execute(
+                        f"SELECT state FROM {self.table_name} WHERE task_id = ?",
+                        (task_id,)
+                    )
+
+                row = cursor.fetchone()
+                if not row:
+                    if db_engine != 'mysql':
+                        conn.commit()
+                    return False
+
+                current_state = row['state'] if isinstance(row, dict) else row[0]
+
+                # 防止终态被覆盖（修复竞态条件）
+                if current_state in ['success', 'failed', 'timeout', 'cancelled']:
+                    logger.warning(
+                        f"Task {task_id} already in terminal state: {current_state}, "
+                        f"skipping mark_as_failed"
+                    )
+                    if db_engine != 'mysql':
+                        conn.commit()
+                    return False
+
+                # 更新任务状态
+                now = datetime.now()
+                if db_engine == 'mysql':
+                    cursor.execute(f"""
+                        UPDATE {self.table_name}
+                        SET state = %s, error = %s, completed_at = %s, updated_at = %s
+                        WHERE task_id = %s
+                    """, ("failed", error, now, now, task_id))
+                else:
+                    cursor.execute(f"""
+                        UPDATE {self.table_name}
+                        SET state = ?, error = ?, completed_at = ?, updated_at = ?
+                        WHERE task_id = ?
+                    """, ("failed", error, now, now, task_id))
+
+                conn.commit()
+                return True
+
+            except Exception as e:
+                logger.error(f"mark_as_failed failed for {task_id}: {e}")
+                conn.rollback()
+                return False
 
     def mark_as_pending_review(self, task_id: str, result: str = None,
                                agent_name: str = None, agent_role: str = None,

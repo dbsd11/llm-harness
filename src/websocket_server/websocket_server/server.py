@@ -231,6 +231,7 @@ class WebSocketServer:
             agent_name=f"ExecutionServer:{server_id}",
             agent_role=agent_role,
             execution_duration=elapsed,
+            dispatch_retry_attempt=msg.context.get("retry_attempt"),
         ))
         # Ack the dispatch now that the task is finalized (ack-after-execute).
         await run_in_db_thread(central_dispatcher._ack, dispatch_id, msg.task_id)

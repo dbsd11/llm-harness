@@ -27,6 +27,15 @@ IMAGE="${IMAGE:-agent-server-platform:latest}"
 CONTAINER="${CONTAINER:-agent-server-platform}"
 SRC_DIR="$REPO_ROOT/src/agent_server_platform"
 DOCKERFILE="$REPO_ROOT/scripts/build/agent_server_platform/Dockerfile"
+DATA_DIR="${DATA_DIR:-/agent-data-files/agent-platform}"
+
+# WS_SERVER_API_KEY: read from local .env if not set explicitly
+if [[ -z "${WS_SERVER_API_KEY:-}" ]]; then
+  _ASP_ENV="$REPO_ROOT/src/agent_server_platform/.env"
+  if [[ -f "$_ASP_ENV" ]]; then
+    WS_SERVER_API_KEY=$(grep '^WS_SERVER_API_KEY=' "$_ASP_ENV" 2>/dev/null | head -1 | cut -d= -f2-)
+  fi
+fi
 
 # expect wrappers for SSH/SCP with password auth
 ssh_pw() {
@@ -84,7 +93,7 @@ echo "==> [4/6] Extract on remote"
 ssh_pw "mkdir -p $REMOTE_DIR && rm -rf $REMOTE_DIR/* && tar -xzf /tmp/backend_deploy.tgz -C $REMOTE_DIR && rm -f /tmp/backend_deploy.tgz"
 
 echo "==> [5/6] Remote docker build + run"
-ssh_pw "cd $REMOTE_DIR && sudo docker build -t $IMAGE -f Dockerfile . && sudo docker run -d --name $CONTAINER --network host --restart unless-stopped -e DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:?DASHSCOPE_API_KEY must be set} -e LLM_BASE_URL=${LLM_BASE_URL:-https://llm-au9yjnfp4n2jfcyb.cn-beijing.maas.aliyuncs.com/compatible-mode/v1} -e LLM_MODEL=${LLM_MODEL:-qwen3.7-plus} -e GRADIO_SERVER_PORT=8080 -e FLASK_SERVER_PORT=5000 -e WS_SERVER_API_URL=${WS_SERVER_API_URL:-https://agent-socket-server.bdzz.com.cn:8765} -e WS_SERVER_WS_URL=${WS_SERVER_WS_URL:-wss://agent-socket-server.bdzz.com.cn:8765} -e SANDBOX_BACKEND_WS_URL=${SANDBOX_BACKEND_WS_URL:-wss://agent-socket-server.bdzz.com.cn:8765} $IMAGE && sleep 3 && sudo docker ps --filter name=$CONTAINER"
+ssh_pw "cd $REMOTE_DIR && sudo docker build -t $IMAGE -f Dockerfile . && sudo mkdir -p $DATA_DIR && sudo docker run -d --name $CONTAINER --network host --restart unless-stopped -v $DATA_DIR:/data -e DB_NAME=/data/agent_server.db -e DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:?DASHSCOPE_API_KEY must be set} -e LLM_BASE_URL=${LLM_BASE_URL:-https://llm-au9yjnfp4n2jfcyb.cn-beijing.maas.aliyuncs.com/compatible-mode/v1} -e LLM_MODEL=${LLM_MODEL:-qwen3.7-plus} -e GRADIO_SERVER_PORT=8080 -e FLASK_SERVER_PORT=5000 -e WS_SERVER_API_URL=${WS_SERVER_API_URL:-https://agent-socket-server.bdzz.com.cn:8765} -e WS_SERVER_WS_URL=${WS_SERVER_WS_URL:-wss://agent-socket-server.bdzz.com.cn:8765} -e SANDBOX_BACKEND_WS_URL=${SANDBOX_BACKEND_WS_URL:-wss://agent-socket-server.bdzz.com.cn:8765} -e WS_SERVER_API_KEY=$WS_SERVER_API_KEY $IMAGE && sleep 3 && sudo docker ps --filter name=$CONTAINER"
 
 echo "==> [6/6] Health check"
 ssh_pw "curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/"

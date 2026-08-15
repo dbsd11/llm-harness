@@ -9,7 +9,7 @@ from .tool_registry import tool_registry
 # Import tools module to trigger registration
 import core.agents.scheduling_agent_tools
 import core.agents.resource_repo_tool  # noqa: F401 — triggers tool registration
-from core.state_machine import TaskState, TASK_STATE_MACHINE
+from core.state_machine import TaskState, TASK_STATE_MACHINE, TASK_EXECUTION_COMPLETE_STATES
 from core.event_bus import event_bus
 from core.message_queue import mqs, TaskMessage
 from core.llm_client import llm_client
@@ -152,6 +152,7 @@ class SchedulingAgent(BaseAgent):
                     subtask_id = self._create_subtask(
                         task_id, sub, topic_id=topic_id, scenario_id=scenario_id,
                         depends_on=deps, local_id_to_task_id=local_id_to_task_id,
+                        context=context,
                     )
                     if subtask_id:
                         local_id_to_task_id[lid] = subtask_id
@@ -174,12 +175,16 @@ class SchedulingAgent(BaseAgent):
                 deadline = time.time() + total_timeout
                 all_replies: Dict[str, dict] = {}
                 failed_ids: set = set()
+                dispatched_ids: set = set()  # Track successfully dispatched tasks
                 gated = False
 
                 for wave_idx, wave in enumerate(waves):
                     remaining = deadline - time.time()
                     if remaining <= 0:
                         logger.warning(f"SchedulingAgent: timeout before wave {wave_idx}")
+                        # Mark all pending tasks in remaining waves as failed
+                        self._fail_unscheduled_tasks(waves, wave_idx, local_id_to_task_id,
+                                                    "Scheduling timeout")
                         break
 
                     wave_msgs = []
@@ -220,17 +225,74 @@ class SchedulingAgent(BaseAgent):
 
                     logger.info(f"SchedulingAgent: wave {wave_idx} dispatching "
                                 f"{len(wave_msgs)} task(s) {[sub['id'] for sub in wave]}")
-                    mqs.dispatch_subtasks(scenario_id, wave_msgs, max_workers=max_workers)
+
+                    # Dispatch with status tracking
+                    dispatch_status = mqs.dispatch_subtasks(scenario_id, wave_msgs, max_workers=max_workers)
+
+                    # Handle dispatch failures
+                    for msg in wave_msgs:
+                        if dispatch_status.get(msg.task_id):
+                            dispatched_ids.add(msg.task_id)
+                        else:
+                            # Dispatch failed - mark task as failed immediately
+                            logger.error(f"Dispatch failed for task {msg.task_id}, marking as failed")
+                            self.task_repo.mark_as_failed(
+                                msg.task_id, "Failed to create dispatch message")
+                            failed_ids.add(msg.task_id)
+                            event_bus.emit("task.dispatch_failed", {
+                                "task_id": msg.task_id,
+                                "reason": "dispatch_message_creation_failed"
+                            }, tenant_id=self.tenant_id)
+
+                    if failed_ids:
+                        self._propagate_failure(
+                            failed_ids, waves, local_id_to_task_id, wave_idx + 1)
+
+                    # Only collect replies for successfully dispatched tasks
+                    wave_dispatched = [msg.task_id for msg in wave_msgs if dispatch_status.get(msg.task_id)]
+                    if not wave_dispatched:
+                        logger.warning(f"Wave {wave_idx}: no tasks successfully dispatched")
+                        continue
 
                     wave_timeout = max(int(remaining), 1)
                     replies = mqs.collect_replies(
-                        scenario_id, len(wave_msgs), timeout=wave_timeout)
+                        scenario_id, len(wave_dispatched), timeout=wave_timeout,
+                        expected_task_ids=wave_dispatched)
+
                     for r in replies:
                         all_replies[r.task_id] = r.result
                         if r.pending_review:
                             gated = True
                         elif not r.success:
                             failed_ids.add(r.task_id)
+
+                    # Handle timeout - tasks that didn't reply in time
+                    replied_ids = {r.task_id for r in replies}
+                    missing_replies = set(wave_dispatched) - replied_ids
+                    if missing_replies:
+                        logger.warning(f"Wave {wave_idx}: {len(missing_replies)} tasks "
+                                     f"did not reply within timeout: {missing_replies}")
+                        for tid in missing_replies:
+                            # Get subtask info for retry
+                            subtask_info = None
+                            for lid, (real_tid, sub) in created_by_id.items():
+                                if real_tid == tid:
+                                    subtask_info = sub
+                                    break
+
+                            # Try to retry or mark as failed
+                            retried = self._retry_or_fail_task(
+                                tid, "Task execution timeout - no reply received",
+                                failed_ids, scenario_id, subtask_info, context
+                            )
+
+                            if not retried:
+                                event_bus.emit("task.timeout", {
+                                    "task_id": tid
+                                }, tenant_id=self.tenant_id)
+                                # Propagate timeout failures to dependents
+                                self._propagate_failure(
+                                    failed_ids, waves, local_id_to_task_id, wave_idx + 1)
 
                     # Manual acceptance: stop at gate after first wave with gated tasks
                     if manual_acceptance and gated:
@@ -243,11 +305,6 @@ class SchedulingAgent(BaseAgent):
                             "subtask_ids": subtask_ids,
                             "replies": all_replies,
                         }
-
-                    # Propagate failure to all remaining dependents.
-                    if failed_ids:
-                        self._propagate_failure(
-                            failed_ids, waves, local_id_to_task_id, wave_idx + 1)
 
                 event_bus.emit("task.scheduled", {
                     "task_id": task_id,
@@ -292,6 +349,141 @@ class SchedulingAgent(BaseAgent):
                 "success": False,
                 "error": error_msg,
             }
+
+    def _calculate_task_timeout(self, subtask: Dict[str, Any], context: Dict[str, Any]) -> int:
+        """Calculate dynamic timeout for a task based on its complexity and type.
+
+        Strategy:
+        - Base timeout from context (default 3600s)
+        - Adjust based on task goal keywords (environment setup, code analysis, etc.)
+        - Add buffer for complex tasks (multiple dependencies, large scope)
+
+        Returns timeout in seconds.
+        """
+        base_timeout = context.get("timeout_seconds", 3600)
+        goal = subtask.get("goal", "").lower()
+
+        # Environment setup tasks - typically fast
+        if any(keyword in goal for keyword in ["环境准备", "代码获取", "git clone", "安装"]):
+            return min(600, base_timeout)  # 10 minutes max
+
+        # Code analysis tasks - medium complexity
+        if any(keyword in goal for keyword in ["分析", "解析", "结构", "架构", "模块"]):
+            # Check if it's a comprehensive analysis
+            if any(keyword in goal for keyword in ["完整", "全面", "深度", "详细"]):
+                return min(900, base_timeout)  # 15 minutes for comprehensive analysis
+            return min(600, base_timeout)  # 10 minutes for basic analysis
+
+        # Report generation tasks - depend on upstream results
+        if any(keyword in goal for keyword in ["报告", "总结", "汇总"]):
+            # More time for report generation as it needs to process upstream results
+            return min(1200, base_timeout)  # 20 minutes
+
+        # Default: use base timeout but cap at reasonable limit
+        return min(base_timeout, 3600)
+
+    def _retry_or_fail_task(self, task_id: str, error_msg: str, failed_ids: set,
+                           scenario_id: str, subtask: Dict[str, Any] = None,
+                           context: Dict[str, Any] = None) -> bool:
+        """Attempt to retry a failed task, or mark it as failed if retries exhausted.
+
+        Args:
+            task_id: Task ID to retry/fail
+            error_msg: Error message to record
+            failed_ids: Set to add failed task IDs to
+            scenario_id: Scenario ID for re-dispatch
+            subtask: Original subtask definition (for re-dispatch)
+            context: Task context (for re-dispatch)
+
+        Returns:
+            True if task was retried, False if marked as failed
+        """
+        task = self.task_repo.find_by_task_id(task_id)
+        if not task:
+            logger.error(f"Task {task_id} not found for retry")
+            self.task_repo.mark_as_failed(task_id, error_msg)
+            failed_ids.add(task_id)
+            return False
+
+        # State-aware guard: skip retry if task already reached a terminal state
+        # (original execution completed after timeout) or is still running
+        # (original execution may still produce a result).
+        current_state = task.state
+        if current_state in TASK_EXECUTION_COMPLETE_STATES:
+            logger.info(f"Task {task_id} already terminal ({current_state}), "
+                        f"skipping retry")
+            if current_state in ('failed', 'timeout', 'cancelled'):
+                failed_ids.add(task_id)
+            return False
+        if current_state == 'running':
+            logger.warning(f"Task {task_id} is still running, skipping retry "
+                           f"to avoid double dispatch")
+            return False
+
+        # Check if retries are exhausted
+        max_retries = task.max_retries or 3
+        current_retries = task.retry_count or 0
+
+        if current_retries >= max_retries:
+            logger.warning(f"Task {task_id} exhausted {max_retries} retries, marking as failed")
+            self.task_repo.mark_as_failed(task_id, f"{error_msg} (after {max_retries} retries)")
+            failed_ids.add(task_id)
+            event_bus.emit("task.failed", {
+                "task_id": task_id,
+                "error": error_msg,
+                "retries_exhausted": True,
+            }, tenant_id=self.tenant_id)
+            return False
+
+        # Increment retry count and reset task to pending
+        new_retry_count = current_retries + 1
+        logger.info(f"Retrying task {task_id} (attempt {new_retry_count}/{max_retries})")
+
+        # Update task state back to pending and increment retry count
+        self.task_repo.increment_retry_count(task_id)
+        task.state = TaskState.PENDING.value
+        task.error = None
+        task.updated_at = datetime.now()
+        self.task_repo.update(task)
+
+        # Re-dispatch the task
+        if subtask and scenario_id:
+            from core.message_queue import mqs, TaskMessage
+
+            # Recalculate timeout with exponential backoff
+            base_timeout = self._calculate_task_timeout(subtask, context) if context else 3600
+            retry_timeout = int(base_timeout * (1.5 ** new_retry_count))  # Exponential backoff
+
+            # Update task timeout
+            task.timeout_seconds = retry_timeout
+            self.task_repo.update(task)
+
+            # Create new dispatch message
+            ctx = dict(subtask.get("context", {}) or {})
+            ctx["retry_attempt"] = new_retry_count
+
+            msg = TaskMessage(
+                task_id=task_id,
+                parent_task_id=task.parent_task_id,
+                goal=task.goal,
+                context=ctx,
+            )
+
+            mqs.dispatch_subtasks(scenario_id, [msg], max_workers=1)
+
+            event_bus.emit("task.retried", {
+                "task_id": task_id,
+                "retry_count": new_retry_count,
+                "error": error_msg,
+            }, tenant_id=self.tenant_id)
+
+            return True
+        else:
+            # Cannot retry without subtask info, mark as failed
+            logger.warning(f"Cannot retry task {task_id} without subtask info, marking as failed")
+            self.task_repo.mark_as_failed(task_id, f"{error_msg} (no retry info)")
+            failed_ids.add(task_id)
+            return False
 
     def _associate_role(self, subtask: Dict[str, Any],
                         configured_roles: List[Dict[str, Any]]):
@@ -433,6 +625,31 @@ class SchedulingAgent(BaseAgent):
                         skipped.add(tid)
         return skipped
 
+    def _fail_unscheduled_tasks(self, waves: List[List[Dict[str, Any]]],
+                                start_wave: int, local_id_to_task_id: Dict[str, str],
+                                reason: str) -> set:
+        """Mark all tasks in waves from start_wave onwards as failed.
+
+        Used when scheduling times out before all waves are dispatched.
+        Returns the set of failed task_ids.
+        """
+        failed = set()
+        for wave in waves[start_wave:]:
+            for sub in wave:
+                tid = local_id_to_task_id.get(sub["id"]) or sub["id"]
+                if tid:
+                    try:
+                        self.task_repo.mark_as_failed(tid, reason)
+                        failed.add(tid)
+                        event_bus.emit("task.unscheduled", {
+                            "task_id": tid, "reason": reason,
+                        }, tenant_id=self.tenant_id)
+                    except Exception as e:
+                        logger.error(f"Failed to mark unscheduled task {tid}: {e}")
+        if failed:
+            logger.warning(f"Marked {len(failed)} tasks as failed due to: {reason}")
+        return failed
+
     def _build_resume_plan(self, scenario_id: str, parent_task_id: str,
                            topic_id: str, context: Dict[str, Any]):
         """Build a resume plan for cycle N > 1 (manual_acceptance resume).
@@ -510,6 +727,7 @@ class SchedulingAgent(BaseAgent):
                     subtask_id = self._create_subtask(
                         parent_task_id, sub, topic_id=topic_id, scenario_id=scenario_id,
                         depends_on=deps, local_id_to_task_id=local_id_to_task_id,
+                        context=context,
                     )
                     if subtask_id:
                         created_by_id[lid] = (subtask_id, sub)
@@ -760,7 +978,8 @@ class SchedulingAgent(BaseAgent):
                         topic_id: str = None,
                         scenario_id: str = None,
                         depends_on: List[str] = None,
-                        local_id_to_task_id: Dict[str, str] = None) -> Optional[str]:
+                        local_id_to_task_id: Dict[str, str] = None,
+                        context: Dict[str, Any] = None) -> Optional[str]:
         """
         Create a subtask with idempotency control (幂等控制).
 
@@ -771,6 +990,7 @@ class SchedulingAgent(BaseAgent):
             depends_on: local predecessor ids (e.g. ["t1"])
             local_id_to_task_id: map to resolve local ids -> real task_ids
                 for persistence. The new task's own id is registered here.
+            context: task context for dynamic timeout calculation
 
         Returns:
             task_id if created/found, None if error
@@ -793,6 +1013,13 @@ class SchedulingAgent(BaseAgent):
             resolved_deps = [local_id_to_task_id[d] for d in depends_on
                              if d in local_id_to_task_id]
 
+        # Calculate dynamic timeout based on task type
+        dynamic_timeout = subtask.get("timeout_seconds")
+        if dynamic_timeout is None and context:
+            dynamic_timeout = self._calculate_task_timeout(subtask, context)
+        elif dynamic_timeout is None:
+            dynamic_timeout = 3600  # default fallback
+
         task = Task(
             task_id=task_id,
             parent_task_id=parent_task_id,
@@ -803,7 +1030,7 @@ class SchedulingAgent(BaseAgent):
             goal=goal,
             state=TaskState.PENDING.value,
             priority=subtask.get("priority", 0),
-            timeout_seconds=subtask.get("timeout_seconds", 3600),
+            timeout_seconds=dynamic_timeout,
             max_retries=3,
             retry_count=0,
             tenant_id=self.tenant_id,

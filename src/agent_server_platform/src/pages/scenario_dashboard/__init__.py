@@ -345,16 +345,17 @@ def create_page(global_state_component):
             # Fetch scenario from ws_server API and pre-fill form
             if not scenario_id:
                 return (gr.update(), gr.update(), gr.update(), gr.update(), "") + \
-                       tuple([gr.update()]*37) + (gr.update(value=False), 0,
-                           "", "", "", "", "", "", "", "", "", "") + (gr.update(),)
+                       tuple([gr.update()]*5) + tuple([gr.update()]*46) + (gr.update(),) + \
+                       tuple([gr.update()]*5) + tuple([gr.update()]*20) + (gr.update(),)
 
             resp = api_client.get_scenario(scenario_id)
             if not resp.get("success"):
                 return (gr.update(visible=False), gr.update(visible=True), gr.update(visible=False),
                         gr.update(visible=False), "", gr.update(), gr.update(), gr.update(),
-                        gr.update(), gr.update()) + tuple([gr.update()]*30) + \
-                        (gr.update(value=False), 0, "", "", "", "", "", "", "", "", "", "",
-                         f"❌ 未找到: {scenario_id}")
+                        gr.update(), gr.update()) + tuple([gr.update()]*10) + tuple([gr.update()]*20) + \
+                        tuple([gr.update()]*10) + ("", 60, "", "", 300, False, 0) + \
+                        tuple([gr.update()]*5) + tuple([gr.update()]*20) + \
+                        (f"❌ 未找到: {scenario_id}",)
 
             s = resp["scenario"]
             config = s.get("config", {})
@@ -390,14 +391,17 @@ def create_page(global_state_component):
                 else:
                     repo_upds.extend(["", "", "", ""])
 
+            role_group_upds = [gr.update(visible=(i < count)) for i in range(10)]
+            repo_group_upds = [gr.update(visible=(i < repo_count)) for i in range(5)]
+
             return (gr.update(visible=False), gr.update(visible=True), gr.update(visible=False),
                     gr.update(visible=False), "", stype, f"{s.get('name', '')} (克隆)",
                     s.get("description", ""), sched, count) + \
-                   tuple(role_upds) + tuple(server_upds) + (
+                   tuple(role_group_upds) + tuple(role_upds) + tuple(server_upds) + (
                        config.get("question", ""), config.get("timeout", 60),
                        config.get("script", ""), config.get("code", ""), config.get("timeout", 300),
                        config.get("manual_acceptance", False), repo_count) + \
-                   tuple(repo_upds) + (f"📋 已从场景 `{scenario_id[:8]}` 克隆配置",)
+                   tuple(repo_group_upds) + tuple(repo_upds) + (f"📋 已从场景 `{scenario_id[:8]}` 克隆配置",)
 
         def hide_create_view():
             role_vals = ["代码执行专家", "你是一个代码执行专家，负责执行代码并返回结果。"]
@@ -568,10 +572,11 @@ def create_page(global_state_component):
             outputs=[scenario_list_content, scenario_create_content, scenario_action_content, scenario_detail_content,
                      show_create_trigger, scenario_type, scenario_name, scenario_desc,
                      scheduling_agent_role, execution_roles_count] +
+                    [r["group"] for r in role_inputs] +
                     [item for r in role_inputs for item in [r["name"], r["role"]]] +
                     [r["server"] for r in role_inputs] +
                     [qa_question, qa_timeout, code_script, code_code, code_timeout, manual_acceptance_box,
-                     resource_repo_count] +
+                     resource_repo_count] + [r["group"] for r in repo_inputs] +
                     [item for r in repo_inputs for item in [r["url"], r["desc"], r["user"], r["token"]]] + [status_msg])
 
     return page
