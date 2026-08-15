@@ -192,6 +192,26 @@ def create_page(global_state_component):
             manual_acceptance_box = gr.Checkbox(label="需要人工验收", value=False,
                 info="启用后每个任务执行完成后需要人工审核")
 
+            gr.Markdown("### 关联资源库（可选）")
+            gr.Markdown("配置场景关联的 Git 资源库，调度 Agent 执行时可从中获取代码上下文。私有仓库需填写用户名和 Token。")
+            resource_repo_count = gr.State(value=0)
+            repo_inputs = []
+            for i in range(5):
+                with gr.Group(visible=(i == 0)) as repo_group:
+                    url_input = gr.Textbox(label=f"资源库 {i+1} Git URL",
+                                          placeholder="https://github.com/org/repo.git")
+                    desc_input = gr.Textbox(label=f"资源库 {i+1} 说明",
+                                           placeholder="核心业务代码")
+                    user_input = gr.Textbox(label=f"资源库 {i+1} 用户名（私有仓库）",
+                                           placeholder="可选", visible=True)
+                    token_input = gr.Textbox(label=f"资源库 {i+1} Token/密码（私有仓库）",
+                                            placeholder="可选", type="password")
+                    repo_inputs.append({"group": repo_group, "url": url_input, "desc": desc_input,
+                                       "user": user_input, "token": token_input})
+            with gr.Row():
+                add_repo_btn = gr.Button("➕ 添加资源库", variant="secondary", size="sm")
+                remove_repo_btn = gr.Button("➖ 删除最后一个资源库", variant="stop", size="sm")
+
             status_msg = gr.Markdown("")
             with gr.Row():
                 create_btn = gr.Button("创建场景", variant="primary")
@@ -235,6 +255,16 @@ def create_page(global_state_component):
             new_count = max(current_count - 1, 1)
             return [new_count] + [gr.update(visible=(i < new_count)) for i in range(10)]
 
+        def add_resource_repo(current_count):
+            if current_count is None: current_count = 0
+            new_count = min(current_count + 1, 5)
+            return [new_count] + [gr.update(visible=(i < new_count)) for i in range(5)]
+
+        def remove_resource_repo(current_count):
+            if current_count is None or current_count <= 0: current_count = 0
+            new_count = max(current_count - 1, 0)
+            return [new_count] + [gr.update(visible=(i < new_count)) for i in range(5)]
+
         def toggle_config_fields(stype):
             return (gr.update(visible=(stype == "simple_qa")),
                     gr.update(visible=(stype == "code_execution")))
@@ -243,7 +273,11 @@ def create_page(global_state_component):
                            r0n,r0r,r1n,r1r,r2n,r2r,r3n,r3r,r4n,r4r,
                            r5n,r5r,r6n,r6r,r7n,r7r,r8n,r8r,r9n,r9r,
                            r0s,r1s,r2s,r3s,r4s,r5s,r6s,r7s,r8s,r9s,
-                           qa_q, qa_t, code_s, code_c, code_t, manual_acc):
+                           qa_q, qa_t, code_s, code_c, code_t, manual_acc,
+                           repo_count,
+                           rp0u,rp0d,rp0user,rp0token,rp1u,rp1d,rp1user,rp1token,
+                           rp2u,rp2d,rp2user,rp2token,rp3u,rp3d,rp3user,rp3token,
+                           rp4u,rp4d,rp4user,rp4token):
             noop = tuple(gr.update() for _ in range(41))
             try:
                 agent_roles = {"scheduling_agent": {"role": sched_role or "任务调度专家"},
@@ -272,6 +306,27 @@ def create_page(global_state_component):
                                    "timeout": int(code_t) if code_t else 300})
                 config["manual_acceptance"] = bool(manual_acc)
 
+                # Collect resource repos
+                repo_url_vals = [rp0u, rp1u, rp2u, rp3u, rp4u]
+                repo_desc_vals = [rp0d, rp1d, rp2d, rp3d, rp4d]
+                repo_user_vals = [rp0user, rp1user, rp2user, rp3user, rp4user]
+                repo_token_vals = [rp0token, rp1token, rp2token, rp3token, rp4token]
+                resource_repos = []
+                for i in range(min(repo_count or 0, 5)):
+                    url = repo_url_vals[i] if i < len(repo_url_vals) else ""
+                    desc = repo_desc_vals[i] if i < len(repo_desc_vals) else ""
+                    user = repo_user_vals[i] if i < len(repo_user_vals) else ""
+                    token = repo_token_vals[i] if i < len(repo_token_vals) else ""
+                    if url and url.strip():
+                        repo_data = {"git_url": url.strip(), "description": desc.strip() or ""}
+                        if user and user.strip():
+                            repo_data["username"] = user.strip()
+                        if token and token.strip():
+                            repo_data["token"] = token.strip()
+                        resource_repos.append(repo_data)
+                if resource_repos:
+                    config["resource_repos"] = resource_repos
+
                 resp = api_client.create_scenario(stype, sname, sdesc, config)
                 if resp.get("success"):
                     sc_id = resp["scenario"].get("scenario_id", "")
@@ -290,14 +345,16 @@ def create_page(global_state_component):
             # Fetch scenario from ws_server API and pre-fill form
             if not scenario_id:
                 return (gr.update(), gr.update(), gr.update(), gr.update(), "") + \
-                       tuple([gr.update()]*37) + (gr.update(value=False), gr.update())
+                       tuple([gr.update()]*37) + (gr.update(value=False), 0,
+                           "", "", "", "", "", "", "", "", "", "") + (gr.update(),)
 
             resp = api_client.get_scenario(scenario_id)
             if not resp.get("success"):
                 return (gr.update(visible=False), gr.update(visible=True), gr.update(visible=False),
                         gr.update(visible=False), "", gr.update(), gr.update(), gr.update(),
                         gr.update(), gr.update()) + tuple([gr.update()]*30) + \
-                        (gr.update(value=False), f"❌ 未找到: {scenario_id}")
+                        (gr.update(value=False), 0, "", "", "", "", "", "", "", "", "", "",
+                         f"❌ 未找到: {scenario_id}")
 
             s = resp["scenario"]
             config = s.get("config", {})
@@ -320,14 +377,27 @@ def create_page(global_state_component):
                     role_upds.extend(["", ""])
                     server_upds.append(gr.update(choices=choices, value=""))
 
+            # Extract resource repos
+            repos = config.get("resource_repos") or []
+            repo_count = min(len(repos), 5)
+            repo_upds = []
+            for i in range(5):
+                if i < len(repos):
+                    repo_upds.append(repos[i].get("git_url", ""))
+                    repo_upds.append(repos[i].get("description", ""))
+                    repo_upds.append(repos[i].get("username", ""))
+                    repo_upds.append(repos[i].get("token", ""))
+                else:
+                    repo_upds.extend(["", "", "", ""])
+
             return (gr.update(visible=False), gr.update(visible=True), gr.update(visible=False),
                     gr.update(visible=False), "", stype, f"{s.get('name', '')} (克隆)",
                     s.get("description", ""), sched, count) + \
                    tuple(role_upds) + tuple(server_upds) + (
                        config.get("question", ""), config.get("timeout", 60),
                        config.get("script", ""), config.get("code", ""), config.get("timeout", 300),
-                       config.get("manual_acceptance", False),
-                       f"📋 已从场景 `{scenario_id[:8]}` 克隆配置")
+                       config.get("manual_acceptance", False), repo_count) + \
+                   tuple(repo_upds) + (f"📋 已从场景 `{scenario_id[:8]}` 克隆配置",)
 
         def hide_create_view():
             role_vals = ["代码执行专家", "你是一个代码执行专家，负责执行代码并返回结果。"]
@@ -336,7 +406,13 @@ def create_page(global_state_component):
             return (gr.update(visible=True), gr.update(visible=False), gr.update(visible=False),
                     gr.update(visible=False), "", "simple_qa", "", "",
                     "你是一个任务调度专家...", 1) + \
-                   tuple(role_vals) + tuple([""] * 10) + ("", 60, "", "", 300, False, "")
+                   tuple(role_vals) + tuple([""] * 10) + ("", 60, "", "", 300, False, 0,
+                       "", "", "", "",  # repo1: url, desc, user, token
+                       "", "", "", "",  # repo2
+                       "", "", "", "",  # repo3
+                       "", "", "", "",  # repo4
+                       "", "", "", "",  # repo5
+                       "")  # status_msg
 
         def show_action_view(trigger_value):
             if trigger_value:
@@ -413,26 +489,35 @@ def create_page(global_state_component):
             inputs=[scenario_type, scenario_name, scenario_desc, scheduling_agent_role, execution_roles_count] +
             [item for r in role_inputs for item in [r["name"], r["role"]]] +
             [r["server"] for r in role_inputs] +
-            [qa_question, qa_timeout, code_script, code_code, code_timeout, manual_acceptance_box],
+            [qa_question, qa_timeout, code_script, code_code, code_timeout, manual_acceptance_box,
+             resource_repo_count] +
+            [item for r in repo_inputs for item in [r["url"], r["desc"], r["user"], r["token"]]],
             outputs=[status_msg] + [item for r in role_inputs for item in [r["name"], r["role"]]]).then(
             fn=hide_create_view, outputs=[scenario_list_content, scenario_create_content,
                 scenario_action_content, scenario_detail_content, show_create_trigger, scenario_type,
                 scenario_name, scenario_desc, scheduling_agent_role, execution_roles_count] +
             [item for r in role_inputs for item in [r["name"], r["role"]]] +
             [r["server"] for r in role_inputs] + [qa_question, qa_timeout, code_script, code_code, code_timeout,
-                manual_acceptance_box, status_msg])
+                manual_acceptance_box, resource_repo_count] +
+            [item for r in repo_inputs for item in [r["url"], r["desc"], r["user"], r["token"]]] + [status_msg])
 
         cancel_create_btn.click(fn=hide_create_view, outputs=[scenario_list_content, scenario_create_content,
             scenario_action_content, scenario_detail_content, show_create_trigger, scenario_type,
             scenario_name, scenario_desc, scheduling_agent_role, execution_roles_count] +
             [item for r in role_inputs for item in [r["name"], r["role"]]] +
             [r["server"] for r in role_inputs] + [qa_question, qa_timeout, code_script, code_code, code_timeout,
-                manual_acceptance_box, status_msg])
+                manual_acceptance_box, resource_repo_count] +
+            [item for r in repo_inputs for item in [r["url"], r["desc"], r["user"], r["token"]]] + [status_msg])
 
         add_role_btn.click(fn=add_execution_role, inputs=[execution_roles_count],
             outputs=[execution_roles_count] + [r["group"] for r in role_inputs])
         remove_role_btn.click(fn=remove_execution_role, inputs=[execution_roles_count],
             outputs=[execution_roles_count] + [r["group"] for r in role_inputs])
+
+        add_repo_btn.click(fn=add_resource_repo, inputs=[resource_repo_count],
+            outputs=[resource_repo_count] + [r["group"] for r in repo_inputs])
+        remove_repo_btn.click(fn=remove_resource_repo, inputs=[resource_repo_count],
+            outputs=[resource_repo_count] + [r["group"] for r in repo_inputs])
 
         def execute_start(sc_id):
             if not sc_id: return "", "❌ 请输入场景ID"
@@ -485,6 +570,8 @@ def create_page(global_state_component):
                      scheduling_agent_role, execution_roles_count] +
                     [item for r in role_inputs for item in [r["name"], r["role"]]] +
                     [r["server"] for r in role_inputs] +
-                    [qa_question, qa_timeout, code_script, code_code, code_timeout, manual_acceptance_box, status_msg])
+                    [qa_question, qa_timeout, code_script, code_code, code_timeout, manual_acceptance_box,
+                     resource_repo_count] +
+                    [item for r in repo_inputs for item in [r["url"], r["desc"], r["user"], r["token"]]] + [status_msg])
 
     return page

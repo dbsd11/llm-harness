@@ -72,7 +72,9 @@ def get_random_work_loop() -> asyncio.AbstractEventLoop:
 #
 # This dedicated executor isolates blocking DB I/O so the default pool is
 # always free for Gradio's sync route handlers.
-_DB_MAX_WORKERS = int(os.getenv("DB_THREAD_POOL_SIZE", "4"))
+# ponytail: raised default from 4 → 10 to match SQLite pool size; tune via env.
+# Previously 4 workers contended on a single SQLite lock, saturating under load.
+_DB_MAX_WORKERS = int(os.getenv("DB_THREAD_POOL_SIZE", "10"))
 _db_executor = ThreadPoolExecutor(
     max_workers=_DB_MAX_WORKERS, thread_name_prefix="db-io"
 )

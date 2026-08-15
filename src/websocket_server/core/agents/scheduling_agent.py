@@ -8,6 +8,7 @@ from .base_agent import BaseAgent
 from .tool_registry import tool_registry
 # Import tools module to trigger registration
 import core.agents.scheduling_agent_tools
+import core.agents.resource_repo_tool  # noqa: F401 — triggers tool registration
 from core.state_machine import TaskState, TASK_STATE_MACHINE
 from core.event_bus import event_bus
 from core.message_queue import mqs, TaskMessage

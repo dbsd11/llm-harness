@@ -57,6 +57,10 @@ _BROADCAST_SEND_TIMEOUT = float(os.getenv("BROADCAST_SEND_TIMEOUT", "2"))
 _BROADCAST_QUEUE_MAXSIZE = int(os.getenv("BROADCAST_QUEUE_MAXSIZE", "500"))
 # 订阅者连续推送失败 N 次后剔除，防止死连接拖慢广播 worker。
 _BROADCAST_FAIL_THRESHOLD = int(os.getenv("BROADCAST_FAIL_THRESHOLD", "3"))
+# ponytail: 心跳写 DB 频率控制 —— 内存中每 HEARTBEAT_INTERVAL 秒更新一次，
+# 但只每 _HEARTBEAT_DB_WRITE_INTERVAL 秒真正写一次 DB。避免高频心跳
+# （每 5s）把 DB 线程池打满导致整个 WS 服务假死。
+_HEARTBEAT_DB_WRITE_INTERVAL = int(os.getenv("HEARTBEAT_DB_WRITE_INTERVAL", "10"))
 
 
 class ConnectionLost(Exception):
@@ -71,6 +75,7 @@ class ConnectedServer:
     connected_at: datetime
     last_heartbeat: datetime
     tenant_id: str = None  # 租户 ID（来自 API Key）
+    _last_db_write: datetime = None  # 上次心跳写 DB 的时间（批量写入控制）
 
 
 class WebSocketServer:
@@ -400,19 +405,37 @@ class WebSocketServer:
         return server_id
 
     async def _handle_heartbeat(self, server_id: str, frame: dict):
-        """Handle status heartbeat from a connected server."""
+        """Handle status heartbeat from a connected server.
+
+        内存中每次都更新（check_heartbeats 超时判断依赖内存值），但只按
+        _HEARTBEAT_DB_WRITE_INTERVAL 频率真正写 DB，避免高频心跳把 DB 线程池打满。
+        env_info 变化时强制写 DB（状态变更不能丢）。
+        """
         if server_id not in self.connections:
             logger.warning(f"收到未知服务器的心跳: {server_id}")
             return
 
         conn = self.connections[server_id]
-        conn.last_heartbeat = datetime.now()
+        now = datetime.now()
+        conn.last_heartbeat = now
 
         payload = frame.get("payload", {})
         status = payload.get("status", STATUS_IDLE)
         running_count = payload.get("running_count", 0)
         env_info = payload.get("env_info")
 
+        # 计算是否需要写 DB：距上次写 DB 超过阈值，或 env_info 发生变化
+        elapsed_db = (
+            999 if conn._last_db_write is None
+            else (now - conn._last_db_write).total_seconds()
+        )
+        should_write_db = elapsed_db >= _HEARTBEAT_DB_WRITE_INTERVAL or env_info is not None
+
+        if not should_write_db:
+            logger.debug(f"跳过 {server_id} 心跳 DB 写入 (elapsed={elapsed_db:.1f}s)")
+            return
+
+        conn._last_db_write = now
         if env_info is not None:
             await run_in_db_thread(lambda: self.server_repo.update_status(
                 server_id, status, running_count=running_count,
@@ -570,6 +593,18 @@ class WebSocketServer:
                 self.pending.pop(tid, None)
                 self.task_server.pop(tid, None)
 
+        # Force flush: if the last heartbeat was skipped (batched), persist
+        # the final state before marking offline so it isn't lost.
+        if conn and conn._last_db_write is not None:
+            elapsed = (datetime.now() - conn._last_db_write).total_seconds()
+            if elapsed >= _HEARTBEAT_DB_WRITE_INTERVAL:
+                try:
+                    await run_in_db_thread(lambda: self.server_repo.update_status(
+                        server_id, STATUS_OFFLINE, running_count=0, connected=False,
+                    ))
+                except Exception as e:
+                    logger.warning(f"Force flush on disconnect failed: {e}")
+
         await run_in_db_thread(self.server_repo.mark_offline, server_id)
         logger.info(f"服务器断开连接: {server_id} "
                     f"(failing {len(to_fail)} in-flight task(s))")
@@ -601,7 +636,10 @@ class WebSocketServer:
     async def _heartbeat_sweeper(self) -> None:
         """Periodically mark DB-stale servers offline (DB-level sweep)."""
         interval = int(os.getenv("HEARTBEAT_INTERVAL", "5"))
-        threshold = max(interval * 3, 10)
+        # ponytail: threshold must accommodate batch delay
+        # (_HEARTBEAT_DB_WRITE_INTERVAL) — otherwise the sweeper may mark
+        # a live server offline simply because its last DB write was deferred.
+        threshold = max(interval * 3 + _HEARTBEAT_DB_WRITE_INTERVAL, 30)
         while True:
             await asyncio.sleep(interval)
             try:

@@ -262,6 +262,17 @@ def summarize_scenario(scenario_id: str) -> str:
                 else:
                     lines.append(f"  - {name}（{role}）→ 未指定服务器（本地执行）")
 
+    resource_repos = config.get("resource_repos") or []
+    if resource_repos:
+        lines.append("")
+        lines.append(f"关联资源库（{len(resource_repos)} 个）：")
+        for r in resource_repos:
+            if isinstance(r, dict):
+                git_url = r.get("git_url", "")
+                desc = r.get("description", "")
+                auth = " 🔒已认证" if r.get("username") and r.get("token") else ""
+                lines.append(f"  - {git_url} ({desc}){auth}")
+
     return "\n".join(lines)
 
 
@@ -304,6 +315,24 @@ def validate_scene_spec(spec: Dict[str, Any]) -> Tuple[bool, str]:
     if "manual_acceptance" in config:
         if not isinstance(config["manual_acceptance"], bool):
             return False, "manual_acceptance 必须是 true 或 false。"
+
+    # 校验 resource_repos（可选，关联 Git 资源库列表）
+    repos = config.get("resource_repos") or []
+    if repos:
+        if not isinstance(repos, list):
+            return False, "resource_repos 必须是数组。"
+        for i, r in enumerate(repos):
+            if not isinstance(r, dict):
+                return False, f"resource_repos[{i}] 必须是对象。"
+            if not (r.get("git_url") or "").strip():
+                return False, f"resource_repos[{i}] 缺少 git_url。"
+            if not (r.get("description") or "").strip():
+                return False, f"resource_repos[{i}] 缺少 description。"
+            # username/token 可选（私有仓库需要）
+            if "username" in r and not isinstance(r["username"], str):
+                return False, f"resource_repos[{i}].username 必须是字符串。"
+            if "token" in r and not isinstance(r["token"], str):
+                return False, f"resource_repos[{i}].token 必须是字符串。"
 
     # 类型专属必填项（与子类 initialize 规则对齐）
     field_key, field_zh = _REQUIRED_FIELD[stype]
@@ -370,6 +399,13 @@ def render_preview(spec: Optional[Dict[str, Any]]) -> str:
         lines.append(f"- **超时**：{config['timeout']} 秒")
     if config.get("manual_acceptance"):
         lines.append("- **人工验收**：已启用")
+    repos = config.get("resource_repos") or []
+    if repos:
+        lines.append(f"- **关联资源库**（{len(repos)} 个）：")
+        for r in repos:
+            if isinstance(r, dict):
+                auth_mark = " 🔒已认证" if r.get("username") and r.get("token") else ""
+                lines.append(f"  - `{r.get('git_url', '')}` — {r.get('description', '')}{auth_mark}")
     ok, err = validate_scene_spec(spec)
     sid_warn = check_server_id_warnings(spec)
     lines.append("")
@@ -471,6 +507,7 @@ config 形状：
     "execution_agents": [{"name": "Agent名", "role": "角色/专长", "server_id": "执行服务器ID"}]
   },
   "manual_acceptance": false,
+  "resource_repos": [{"git_url": "https://github.com/org/repo.git", "description": "仓库用途说明"}],
   "question" | "script"/"code": ...,
   "timeout": 3600
 }
@@ -489,6 +526,15 @@ config 形状：
 - 设为 `true` 时，每个任务执行完成后会暂停等待人工审核，审核通过后才能继续下一步。
 - 仅当用户明确要求「人工验收」「人工审核」「需要人工确认」等时才设为 `true`。
 - 默认为 `false`（不需要人工验收）。
+
+**关联资源库（resource_repos）**— 可选：
+- 如果场景涉及特定代码库或文档，可在 config 中添加 `resource_repos` 数组。
+- 每个元素包含 `git_url`（git 仓库地址）和 `description`（仓库用途说明）。
+- 调度 Agent 执行时会通过这些资源库获取代码上下文（grep、git log 等）。
+- 私有仓库需额外提供 `username` 和 `token`（如 GitHub Personal Access Token）。
+- 示例（公开仓库）：`{"git_url": "https://github.com/org/repo.git", "description": "核心业务代码"}`
+- 示例（私有仓库）：`{"git_url": "https://github.com/org/private-repo.git", "description": "内部文档", "username": "user", "token": "ghp_xxx"}`
+- 仅当用户明确提到需要关联代码库时才添加；不要主动臆造。
 
 **重要**：当你正在**创建新场景**或**修改已有场景**时，在回复末尾附一个完整的 ```scene-spec``` 代码块，包含**全量最新配置**（不要只给增量）。格式：
 ```scene-spec

@@ -423,6 +423,14 @@ class ScenarioManager:
             logger.info(f"Scenario {scenario_id}: released {released_runs} agent run(s), "
                        f"cancelled {cancelled_tasks} task(s)")
 
+        # 4. Cleanup cached resource repos for this tenant (best-effort)
+        if _tenant_id:
+            try:
+                from core.agents.resource_repo_tool import cleanup_resource_repo_cache
+                cleanup_resource_repo_cache(tenant_id=_tenant_id)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup resource repo cache for {scenario_id}: {e}")
+
     def review_task(self, task_id: str, passed: bool, feedback: str = None) -> bool:
         """Human acceptance entry point (called from UI + REST).
 
