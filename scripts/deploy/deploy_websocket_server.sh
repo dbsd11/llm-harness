@@ -80,6 +80,12 @@ tar -C "$WS_SOURCE" \
 # 复制 Dockerfile
 cp "$DOCKERFILE_SRC" "$STAGE/Dockerfile"
 
+# 复制健康检查脚本 (Dockerfile HEALTHCHECK 依赖)
+HEALTHCHECK_SRC="$(dirname "$DOCKERFILE_SRC")/healthcheck.py"
+if [[ -f "$HEALTHCHECK_SRC" ]]; then
+  cp "$HEALTHCHECK_SRC" "$STAGE/healthcheck.py"
+fi
+
 # [2/5] 打包
 echo "[2/5] 打包代码..."
 tar -czf "$TAR" -C "$STAGE" .

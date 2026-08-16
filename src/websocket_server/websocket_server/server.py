@@ -17,7 +17,9 @@ import json
 import logging
 import os
 import ssl
+import sys
 import threading
+import time
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
@@ -651,6 +653,92 @@ class WebSocketServer:
             except Exception as e:
                 logger.error(f"Heartbeat sweeper error: {e}")
 
+    # ── self-watchdog (container self-heal) ────────────────────────────────
+
+    def _start_self_watchdog(self) -> None:
+        """Start daemon thread that exits the process when the server is
+        unrecoverably stuck (event loop hang or persistent DB failure).
+
+        Docker ``restart: unless-stopped`` then restarts the container.
+        Controlled by env vars:
+          WS_SELF_WATCHDOG=1        (0 to disable)
+          WS_WATCHDOG_INTERVAL=10   (check interval in seconds)
+          WS_WATCHDOG_THRESHOLD=6   (consecutive failures before exit)
+        """
+        if os.getenv("WS_SELF_WATCHDOG", "1") == "0":
+            return
+        interval = int(os.getenv("WS_WATCHDOG_INTERVAL", "10"))
+        threshold = int(os.getenv("WS_WATCHDOG_THRESHOLD", "6"))
+        t = threading.Thread(
+            target=self._self_watchdog_thread,
+            args=(interval, threshold),
+            daemon=True,
+            name="self-watchdog",
+        )
+        t.start()
+        logger.info(
+            f"Self-watchdog started (interval={interval}s, "
+            f"threshold={threshold}, grace=60s)"
+        )
+
+    def _self_watchdog_thread(self, interval: int, threshold: int) -> None:
+        """Daemon thread: probe event loop + DB, exit on persistent failure."""
+        time.sleep(60)
+
+        loop = self._loop
+        consecutive_failures = 0
+
+        while True:
+            time.sleep(interval)
+            if loop.is_closed():
+                return
+
+            ok = True
+
+            loop_alive = threading.Event()
+            try:
+                loop.call_soon_threadsafe(loop_alive.set)
+            except RuntimeError:
+                ok = False
+
+            if not loop_alive.wait(timeout=max(interval * 2, 10)):
+                ok = False
+
+            if ok and not self._watchdog_db_probe():
+                ok = False
+
+            if ok:
+                if consecutive_failures > 0:
+                    logger.info("Watchdog: health recovered")
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                logger.warning(
+                    f"Watchdog: health check failed "
+                    f"({consecutive_failures}/{threshold})"
+                )
+                if consecutive_failures >= threshold:
+                    logger.critical(
+                        f"Watchdog: {consecutive_failures} consecutive failures, "
+                        f"exiting for Docker restart"
+                    )
+                    os._exit(1)
+
+    @staticmethod
+    def _watchdog_db_probe() -> bool:
+        """Direct DB connectivity probe (runs in watchdog thread, not event loop)."""
+        try:
+            from database.connection import get_connection_manager
+            cm = get_connection_manager()
+            with cm.get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.close()
+            return True
+        except Exception as e:
+            logger.warning(f"Watchdog: DB probe failed: {e}")
+            return False
+
     # ── lifecycle ─────────────────────────────────────────────────────────
 
     def run(self):
@@ -692,6 +780,9 @@ class WebSocketServer:
         # Heartbeat tasks on the WS loop
         loop.create_task(self.check_heartbeats())
         loop.create_task(self._heartbeat_sweeper())
+
+        # Self-watchdog: daemon thread that exits process on persistent failure
+        self._start_self_watchdog()
 
         try:
             loop.run_forever()

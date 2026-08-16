@@ -20,5 +20,9 @@ EXPOSE 8765
 
 RUN mkdir -p /data
 
+# Health check: probes /api/health every 30s, 5s timeout, 3 consecutive failures -> unhealthy
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python /app/healthcheck.py
+
 # Run the websocket server
 CMD ["python", "-m", "websocket_server"]

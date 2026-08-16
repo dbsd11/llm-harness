@@ -39,12 +39,33 @@ def _server_to_dict(s, ws_server) -> dict:
 
 
 async def health(request: web.Request) -> web.Response:
-    """健康检查"""
+    """健康检查：验证 event loop 存活 + DB 可达"""
     ws_server = request.app["ws_server"]
-    return web.json_response({
-        "status": "ok",
+    db_ok = True
+    db_error = None
+    try:
+        def _check():
+            from database.connection import get_connection_manager
+            cm = get_connection_manager()
+            with cm.get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.close()
+        await run_in_db_thread(_check)
+    except Exception as e:
+        db_ok = False
+        db_error = str(e)
+        logger.warning(f"Health check: DB unreachable: {e}")
+
+    status_code = 200 if db_ok else 503
+    body = {
+        "status": "ok" if db_ok else "unhealthy",
+        "database": "ok" if db_ok else "error",
         "connected_servers": len(ws_server.connections),
-    })
+    }
+    if db_error:
+        body["error"] = db_error
+    return web.json_response(body, status=status_code)
 
 
 async def list_servers(request: web.Request) -> web.Response:
