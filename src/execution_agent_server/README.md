@@ -2,6 +2,58 @@
 
 独立封装的执行 Agent Server 模块，用于在 Docker 沙箱中运行。
 
+## 功能特性
+
+- **意图检测**: 根据任务上下文自动识别执行意图（generate_plan / execute_plan / revise_plan / direct_execute）
+- **智能规划**: 使用 ReAct 循环生成执行计划，支持工具调用（run_bash、ask_assistant）
+- **计划审核**: 在 assistant mode 下，先生成计划供助手审核，审核通过后再执行
+- **计划修正**: 根据审核反馈修正计划，支持多轮审核
+- **直接执行**: 对于简单任务或助手角色的任务，直接执行无需规划
+- **工具系统**: 可扩展的工具注册表，支持 OpenAI function calling 格式
+- **ask_assistant**: 执行过程中可向助手角色请求补充信息（阻塞等待响应）
+
+## 意图类型
+
+| 意图 | 触发条件 | 行为 |
+|------|----------|------|
+| `generate_plan` | 默认，或 `task_type="generate_plan"` | 使用 ReAct 循环生成执行计划 |
+| `execute_plan` | `task_type="execute_plan"` 或上下文包含 `plan` | 逐步执行已审批的计划 |
+| `revise_plan` | `task_type="revise_plan"` 或上下文包含 `plan` + `review_feedback` | 根据反馈修正计划 |
+| `direct_execute` | `task_type="direct_execute"` | 通用 ReAct 执行（无规划阶段） |
+
+## 工具
+
+### run_bash
+
+在服务器本地 shell 中执行 bash 命令。
+
+```json
+{
+  "command": "ls -la /data",
+  "timeout": 30
+}
+```
+
+### ask_assistant (仅 assistant mode)
+
+向助手角色请求补充信息。执行会阻塞直到助手响应或超时。
+
+```json
+{
+  "question": "请确认目标数据库的连接信息"
+}
+```
+
+## Assistant Mode
+
+当场景配置了助手角色时，系统自动启用 assistant mode：
+
+1. 执行代理生成计划（`generate_plan`）并返回 `phase="plan_ready"`
+2. 调度代理将计划发送给助手角色审核
+3. 助手审核计划并返回反馈
+4. 如果通过，执行代理执行计划（`execute_plan`）
+5. 如果有反馈，执行代理修正计划（`revise_plan`）后重新审核
+
 ## 目录结构
 
 ```
@@ -9,14 +61,17 @@ execution_agent_server/
 ├── execution_server/          # 执行服务器核心
 │   ├── __main__.py           # 入口点
 │   ├── server.py             # 服务器实现
-│   ├── ws_client.py          # WebSocket 客户端
-│   ├── task_runner.py        # 任务执行器
+│   ├── ws_client.py          # WebSocket 客户端 (处理 ask_assistant_response)
+│   ├── task_runner.py        # 任务执行器 (传递 ws_client, assistant_mode)
 │   ├── config.py             # 配置加载
 │   └── env_probe.py          # 环境探测
 ├── core/                     # 核心模块
 │   ├── agents/               # Agent 实现
 │   │   ├── base_agent.py     # Agent 基类
-│   │   └── execution_agent.py # 执行 Agent
+│   │   └── execution_agent.py # 执行 Agent (意图检测, 规划, 执行)
+│   ├── pending_answer.py     # ask_assistant 阻塞等待存储
+│   ├── tool_registry.py      # 工具注册表 (OpenAI function calling 格式)
+│   ├── tools.py              # 内置工具 (BashTool, AskAssistantTool)
 │   ├── event_bus.py          # 事件总线
 │   ├── llm_client.py         # LLM 客户端
 │   ├── state_machine.py      # 状态机

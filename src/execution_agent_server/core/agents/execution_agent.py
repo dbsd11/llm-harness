@@ -1,44 +1,24 @@
-# Execution Agent - Plan-first execution with ReAct steps
+# Execution Agent - Intent-aware plan-first execution with ReAct steps.
+#
+# Supports three intents (modeled after bug-agent-server):
+#   generate_plan  — agentic plan generation with tool calls
+#   revise_plan    — revise an existing plan based on review feedback
+#   execute_plan   — execute an approved plan step by step
+#
+# In assistant_mode, plan generation/revision returns the plan for review
+# instead of executing it immediately.
 import json
 import os
 import re
-import subprocess
 from typing import Dict, Any, List, Optional
 from .base_agent import BaseAgent
 from core.llm_client import llm_client
 from core.event_bus import event_bus
+from core.tools import create_tool_registry
 from logger import logger
 
 _MAX_STEP_ITERATIONS = 15
-_DEFAULT_CMD_TIMEOUT = 30
-
-BASH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "run_bash",
-        "description": (
-            "在服务器本地 shell 中执行 bash 命令。"
-            "可运行任意 shell 命令（python、curl、文件操作等）。"
-            "返回 stdout 和 stderr 的合并输出，以及退出码。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "要执行的 bash 命令",
-                },
-                "timeout": {
-                    "type": "integer",
-                    "description": f"命令超时秒数，默认 {_DEFAULT_CMD_TIMEOUT}s",
-                },
-            },
-            "required": ["command"],
-        },
-    },
-}
-
-TOOLS = [BASH_TOOL]
+_MAX_PLAN_ITERATIONS = 8
 
 ENGINEERING_CONSTRAINTS = (
     "【工程约束 — 规划必须遵循】\n"
@@ -50,28 +30,10 @@ ENGINEERING_CONSTRAINTS = (
     "无障碍基础、用户明确要求的功能 — 这些不可省略\n"
 )
 
-
-def _execute_bash(command: str, timeout: int = _DEFAULT_CMD_TIMEOUT) -> dict:
-    try:
-        result = subprocess.run(
-            command, shell=True, executable="/bin/bash",
-            capture_output=True, text=True, timeout=timeout,
-        )
-        output = result.stdout
-        if result.stderr:
-            output += ("\n" if output else "") + result.stderr
-        if result.returncode != 0:
-            output += f"\n[exit code: {result.returncode}]"
-        return {
-            "output": output.strip() or "(no output)",
-            "exit_code": result.returncode,
-            "timed_out": False,
-        }
-    except subprocess.TimeoutExpired:
-        return {"output": f"[error] command timed out after {timeout}s",
-                "exit_code": -1, "timed_out": True}
-    except Exception as e:
-        return {"output": f"[error] {e}", "exit_code": -1, "timed_out": False}
+INTENT_GENERATE_PLAN = "generate_plan"
+INTENT_EXECUTE_PLAN = "execute_plan"
+INTENT_REVISE_PLAN = "revise_plan"
+INTENT_DIRECT_EXECUTE = "direct_execute"
 
 
 def _write_upstream_files(upstream: List[str], task_id: str) -> List[str]:
@@ -90,17 +52,21 @@ def _write_upstream_files(upstream: List[str], task_id: str) -> List[str]:
 
 
 class ExecutionAgent(BaseAgent):
-    """Plan-first execution agent.
+    """Intent-aware plan-first execution agent.
 
-    Phase 1 — Plan:  LLM generates P0..Pn execution plan with engineering constraints.
-    Phase 2 — Execute: each plan step runs through a ReAct loop with bash tool.
-    Phase 3 — Judge:  per-step results aggregated for LLM scoring.
+    Phase 1 — Plan:  Agentic plan generation with tool calls (ReAct loop).
+    Phase 1b — Revise: Revise plan based on assistant review feedback.
+    Phase 2 — Execute: Each plan step runs through a ReAct loop with bash tool.
+    Phase 3 — Aggregate: Per-step results aggregated into report.
+    Phase 4 — Judge: LLM scores execution quality.
     """
 
     def __init__(self):
         self.config = {}
         self.role = None
         self.system_prompt = None
+        self._ws_client = None
+        self._assistant_mode = False
 
     def get_agent_type(self) -> str:
         return "execution"
@@ -109,7 +75,36 @@ class ExecutionAgent(BaseAgent):
         self.config = config
         self.role = config.get("role", "general assistant")
         self.system_prompt = config.get("system_prompt", "You are a helpful assistant.")
-        logger.info(f"ExecutionAgent initialized with role: {self.role}")
+        self._ws_client = config.get("ws_client")
+        self._assistant_mode = config.get("assistant_mode", False)
+        logger.info(f"ExecutionAgent initialized: role={self.role}, "
+                    f"assistant_mode={self._assistant_mode}")
+
+    # ──────────────────────────────────────────────
+    #  Intent detection
+    # ──────────────────────────────────────────────
+
+    @staticmethod
+    def _detect_intent(context: Dict[str, Any]) -> str:
+        """Detect task intent from context.
+
+        Priority:
+        1. Explicit task_type from scheduling agent
+        2. Context heuristics (plan + review_feedback → revise, plan → execute)
+        3. Default: generate_plan
+        """
+        task_type = context.get("task_type")
+        if task_type in (INTENT_GENERATE_PLAN, INTENT_EXECUTE_PLAN,
+                         INTENT_REVISE_PLAN, INTENT_DIRECT_EXECUTE):
+            return task_type
+
+        plan = context.get("plan")
+        if plan and context.get("review_feedback"):
+            return INTENT_REVISE_PLAN
+        if plan:
+            return INTENT_EXECUTE_PLAN
+
+        return INTENT_GENERATE_PLAN
 
     # ──────────────────────────────────────────────
     #  Main entry point
@@ -125,49 +120,257 @@ class ExecutionAgent(BaseAgent):
 
             upstream = context.get("upstream_outputs") or []
             server_id = context.get("server_id", "")
-            logger.info(f"ExecutionAgent (plan-first) processing: {question[:100]}...")
+            logger.info(f"ExecutionAgent processing task {task_id}: "
+                        f"{question[:100]}...")
 
             upstream_files = _write_upstream_files(upstream, task_id)
+            intent = self._detect_intent(context)
+            logger.info(f"Task {task_id} intent: {intent}")
 
-            # Phase 1: Plan
-            plan = self._generate_plan(task_id, question, upstream_files, server_id)
-            plan_path = self._save_plan(plan, task_id)
+            if intent == INTENT_GENERATE_PLAN:
+                return self._handle_generate_plan(
+                    task_id, question, upstream_files, server_id, context)
 
-            # Phase 2: Execute
-            step_results = self._execute_plan(task_id, plan, upstream_files, server_id)
+            elif intent == INTENT_REVISE_PLAN:
+                return self._handle_revise_plan(
+                    task_id, question, upstream_files, server_id, context)
 
-            # Phase 3: Aggregate
-            output = self._build_step_summary(plan, step_results, plan_path)
+            elif intent == INTENT_EXECUTE_PLAN:
+                return self._handle_execute_plan(
+                    task_id, question, upstream_files, server_id, context)
 
-            # Phase 4: Judge (per-step results)
-            success, error_msg = self._judge_task_success(
-                question, plan, step_results, output, task_id)
+            elif intent == INTENT_DIRECT_EXECUTE:
+                return self._handle_direct_execute(
+                    task_id, question, upstream_files, server_id, context)
 
-            event_bus.emit("task.execution_completed", {
-                "task_id": task_id, "role": self.role,
-                "response_length": len(output), "success": success,
-            })
-
-            result = {"success": success, "output": output,
-                      "role": self.role, "question": question}
-            if error_msg:
-                result["error"] = error_msg
-                logger.warning(f"Task {task_id} execution result: {error_msg}")
-            return result
+            else:
+                raise ValueError(f"Unknown intent: {intent}")
 
         except Exception as e:
             error_msg = str(e)
             logger.error(f"ExecutionAgent error for task {task_id}: {error_msg}")
-            event_bus.emit("task.execution_failed", {"task_id": task_id, "error": error_msg})
+            event_bus.emit("task.execution_failed",
+                          {"task_id": task_id, "error": error_msg})
             return {"success": False, "output": "", "error": error_msg}
 
     # ──────────────────────────────────────────────
-    #  Phase 1: Plan
+    #  Intent handlers
     # ──────────────────────────────────────────────
 
-    def _generate_plan(self, task_id: str, question: str,
-                       upstream_files: List[str], server_id: str) -> List[Dict]:
-        """LLM generates P0..Pn execution plan."""
+    def _handle_generate_plan(self, task_id: str, question: str,
+                              upstream_files: List[str], server_id: str,
+                              context: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate a plan. In assistant_mode, return it for review."""
+        tools = self._build_tool_registry(task_id, question)
+        plan = self._generate_plan_agentic(
+            task_id, question, upstream_files, server_id, tools)
+        plan_path = self._save_plan(plan, task_id)
+
+        if self._assistant_mode:
+            plan_json = json.dumps(plan, ensure_ascii=False)
+            event_bus.emit("task.plan_generated",
+                          {"task_id": task_id, "role": self.role})
+            event_bus.emit("task.execution_completed", {
+                "task_id": task_id, "role": self.role,
+                "response_length": len(plan_json), "success": True,
+            })
+            return {
+                "success": True,
+                "output": plan_json,
+                "phase": "plan_ready",
+                "plan": plan,
+                "plan_path": plan_path,
+                "role": self.role,
+                "question": question,
+            }
+
+        step_results = self._execute_plan(task_id, plan, upstream_files, server_id)
+        output = self._build_step_summary(plan, step_results, plan_path)
+        success, error_msg = self._judge_task_success(
+            question, plan, step_results, output, task_id)
+
+        event_bus.emit("task.execution_completed", {
+            "task_id": task_id, "role": self.role,
+            "response_length": len(output), "success": success,
+        })
+
+        result = {"success": success, "output": output,
+                  "role": self.role, "question": question}
+        if error_msg:
+            result["error"] = error_msg
+        return result
+
+    def _handle_revise_plan(self, task_id: str, question: str,
+                            upstream_files: List[str], server_id: str,
+                            context: Dict[str, Any]) -> Dict[str, Any]:
+        """Revise an existing plan based on review feedback."""
+        existing_plan = context.get("plan", [])
+        review_feedback = context.get("review_feedback", "")
+        tools = self._build_tool_registry(task_id, question)
+
+        plan = self._revise_plan(
+            task_id, existing_plan, review_feedback,
+            upstream_files, server_id, tools)
+        plan_path = self._save_plan(plan, task_id)
+
+        if self._assistant_mode:
+            plan_json = json.dumps(plan, ensure_ascii=False)
+            event_bus.emit("task.execution_completed", {
+                "task_id": task_id, "role": self.role,
+                "response_length": len(plan_json), "success": True,
+            })
+            return {
+                "success": True,
+                "output": plan_json,
+                "phase": "plan_ready",
+                "plan": plan,
+                "plan_path": plan_path,
+                "role": self.role,
+                "question": question,
+            }
+
+        step_results = self._execute_plan(task_id, plan, upstream_files, server_id)
+        output = self._build_step_summary(plan, step_results, plan_path)
+        success, error_msg = self._judge_task_success(
+            question, plan, step_results, output, task_id)
+
+        result = {"success": success, "output": output,
+                  "role": self.role, "question": question}
+        if error_msg:
+            result["error"] = error_msg
+        return result
+
+    def _handle_execute_plan(self, task_id: str, question: str,
+                              upstream_files: List[str], server_id: str,
+                              context: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute an approved plan."""
+        plan = context.get("plan", [])
+        if not plan:
+            raise ValueError("execute_plan intent requires 'plan' in context")
+
+        plan_path = self._save_plan(plan, task_id)
+        step_results = self._execute_plan(task_id, plan, upstream_files, server_id)
+        output = self._build_step_summary(plan, step_results, plan_path)
+        success, error_msg = self._judge_task_success(
+            question, plan, step_results, output, task_id)
+
+        event_bus.emit("task.execution_completed", {
+            "task_id": task_id, "role": self.role,
+            "response_length": len(output), "success": success,
+        })
+
+        result = {"success": success, "output": output,
+                  "role": self.role, "question": question}
+        if error_msg:
+            result["error"] = error_msg
+        return result
+
+    def _handle_direct_execute(self, task_id: str, question: str,
+                               upstream_files: List[str], server_id: str,
+                               context: Dict[str, Any]) -> Dict[str, Any]:
+        """Direct execution with ReAct loop (no planning phase).
+
+        Used for tasks like plan review or ask_assistant answers that need
+        a general-purpose response rather than a structured execution plan.
+        """
+        tools = self._build_tool_registry(task_id, question)
+        tool_defs = tools.to_openai_tools()
+
+        system_msg = (
+            f"你是一个智能助手。你的角色是：{self.role}\n\n"
+            f"【角色定义】\n{self.system_prompt}\n\n"
+            "请根据用户的问题，使用可用工具收集必要信息后给出完整回答。\n"
+            "如果需要执行命令来获取信息，请使用 run_bash 工具。\n"
+            "回答应直接、完整、有用。"
+        )
+        if server_id:
+            system_msg += f"\n\n【执行环境】服务器 ID：`{server_id}`"
+
+        user_msg = question
+        if upstream_files:
+            user_msg += "\n\n【前序任务输出文件】\n"
+            user_msg += "\n".join(f"- {p}" for p in upstream_files)
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+
+        output = ""
+
+        if not tool_defs:
+            response = llm_client.chat(messages, temperature=0.3)
+            output = response or "[LLM returned empty response]"
+        else:
+            for iteration in range(_MAX_STEP_ITERATIONS):
+                if not llm_client.client:
+                    raise RuntimeError("LLM client not configured")
+
+                response = llm_client.chat_with_tools(messages, tool_defs, temperature=0.3)
+                if response is None:
+                    output = "[LLM returned empty response]"
+                    break
+
+                content = response.get("content", "") or ""
+                tool_calls = response.get("tool_calls")
+
+                assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
+                if tool_calls:
+                    assistant_msg["tool_calls"] = tool_calls
+                messages.append(assistant_msg)
+
+                if not tool_calls:
+                    output = content
+                    logger.info(f"Direct execute completed after {iteration + 1} iterations")
+                    break
+
+                for tc in tool_calls:
+                    fn_name = tc["function"]["name"]
+                    try:
+                        fn_args = json.loads(tc["function"]["arguments"])
+                    except json.JSONDecodeError:
+                        fn_args = {}
+
+                    tool_output = tools.call(fn_name, **fn_args)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": tool_output,
+                    })
+            else:
+                logger.warning(f"Direct execute hit max iterations ({_MAX_STEP_ITERATIONS})")
+                output = content or "[达到最大迭代次数]"
+
+        event_bus.emit("task.execution_completed", {
+            "task_id": task_id, "role": self.role,
+            "response_length": len(output), "success": True,
+        })
+
+        return {"success": True, "output": output,
+                "role": self.role, "question": question}
+
+    def _build_tool_registry(self, task_id: str, question: str):
+        """Create tool registry with appropriate tools."""
+        context_summary = f"Task: {question[:200]}"
+        return create_tool_registry(
+            assistant_mode=self._assistant_mode,
+            ws_client=self._ws_client,
+            task_id=task_id,
+            context_summary=context_summary,
+        )
+
+    # ──────────────────────────────────────────────
+    #  Phase 1: Agentic Plan Generation
+    # ──────────────────────────────────────────────
+
+    def _generate_plan_agentic(self, task_id: str, question: str,
+                                upstream_files: List[str], server_id: str,
+                                tools) -> List[Dict]:
+        """Generate plan with tool support (ReAct loop).
+
+        The LLM can call tools (bash, ask_assistant) during planning to gather
+        information before committing to a plan.
+        """
         upstream_hint = ""
         if upstream_files:
             upstream_hint = (
@@ -178,52 +381,112 @@ class ExecutionAgent(BaseAgent):
 
         server_hint = f"\n【执行环境】服务器 ID：`{server_id}`" if server_id else ""
 
-        plan_prompt = (
-            f"你是一个工程规划专家。请为以下任务生成精简的执行计划。\n\n"
-            f"【任务目标】\n{question}\n\n"
+        tool_defs = tools.to_openai_tools()
+
+        system_msg = (
+            "你是一个工程规划专家。你可以通过工具收集信息，然后生成精简的执行计划。\n\n"
             f"【角色定义】\n{self.system_prompt}\n"
             f"{server_hint}"
             f"{upstream_hint}\n"
             f"{ENGINEERING_CONSTRAINTS}\n"
-            f"【规划要求】\n"
-            f"1. 分析任务目标，确定最短实现路径\n"
-            f"2. 将任务分解为 P0, P1, ..., Pn 个按优先级排序的执行步骤\n"
-            f"3. 每个步骤必须具体、可执行、有明确的完成标准\n"
-            f"4. 步骤数量精简（通常 2-5 步），避免不必要的步骤\n"
-            f"5. P0 是最高优先级，必须完成；后续步骤按重要性递减\n"
-            f"6. 每个步骤的 description 应包含具体要执行的命令或操作\n\n"
-            f"返回格式（严格遵循）：\n"
-            f"```json\n"
-            f"{{\n"
-            f'  "goal_analysis": "简短的目标分析",\n'
-            f'  "steps": [\n'
-            f"    {{\n"
-            f'      "id": "P0",\n'
-            f'      "description": "步骤描述（包含具体操作）",\n'
-            f'      "expected_output": "预期产出"\n'
-            f"    }}\n"
-            f"  ]\n"
-            f"}}\n"
-            f"```\n\n"
-            f"只返回 JSON，不要其他内容。"
+            "【规划流程】\n"
+            "1. 分析任务目标，确定需要哪些额外信息\n"
+            "2. 使用工具（如 run_bash 探索环境、ask_assistant 请求补充信息）收集必要信息\n"
+            "3. 基于收集的信息，生成精简的执行计划\n"
+            "4. 计划确定后，直接输出 JSON 格式的计划\n\n"
+            "【规划要求】\n"
+            "1. 选择最直接的实现路径\n"
+            "2. 将任务分解为 P0, P1, ..., Pn 个按优先级排序的执行步骤\n"
+            "3. 每个步骤必须具体、可执行、有明确的完成标准\n"
+            "4. 步骤数量精简（通常 2-5 步），避免不必要的步骤\n"
+            "5. P0 是最高优先级，必须完成；后续步骤按重要性递减\n"
+            "6. 每个步骤的 description 应包含具体要执行的命令或操作\n\n"
+            "【输出格式】\n"
+            "当你完成信息收集并确定计划后，输出以下 JSON 格式（用 ```json 包裹）：\n"
+            "```json\n"
+            '{"goal_analysis": "简短的目标分析",\n'
+            ' "steps": [\n'
+            '   {"id": "P0", "description": "步骤描述", "expected_output": "预期产出"}\n'
+            " ]}\n"
+            "```"
         )
 
-        messages = [
-            {"role": "system", "content": "你是工程规划助手，只输出 JSON。"},
-            {"role": "user", "content": plan_prompt},
+        user_msg = f"【任务目标】\n{question}"
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
         ]
 
+        if not tool_defs:
+            return self._generate_plan_simple(task_id, question, messages)
+
+        for iteration in range(_MAX_PLAN_ITERATIONS):
+            if not llm_client.client:
+                raise RuntimeError("LLM client not configured")
+
+            response = llm_client.chat_with_tools(messages, tool_defs, temperature=0.3)
+            if response is None:
+                logger.warning(f"Plan generation returned empty for {task_id}")
+                break
+
+            content = response.get("content", "") or ""
+            tool_calls = response.get("tool_calls")
+
+            assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
+
+            if not tool_calls:
+                logger.info(f"Plan generation completed after {iteration + 1} iterations")
+                break
+
+            for tc in tool_calls:
+                fn_name = tc["function"]["name"]
+                try:
+                    fn_args = json.loads(tc["function"]["arguments"])
+                except json.JSONDecodeError:
+                    fn_args = {}
+
+                logger.info(f"Plan generation tool call: {fn_name}({json.dumps(fn_args, ensure_ascii=False)[:200]})")
+                tool_output = tools.call(fn_name, **fn_args)
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": tool_output,
+                })
+        else:
+            logger.warning(f"Plan generation hit max iterations ({_MAX_PLAN_ITERATIONS})")
+
+        return self._parse_plan_from_messages(messages, task_id, question)
+
+    def _generate_plan_simple(self, task_id: str, question: str,
+                               messages: List[Dict]) -> List[Dict]:
+        """Fallback: generate plan without tool support."""
         response = llm_client.chat(messages, temperature=0.2)
         if not response:
-            logger.warning(f"Plan generation returned empty for {task_id}, using single-step plan")
-            return [{"id": "P0", "description": question,
-                     "expected_output": "任务完成"}]
+            logger.warning(f"Plan generation returned empty for {task_id}")
+            return [{"id": "P0", "description": question, "expected_output": "任务完成"}]
+        return self._parse_plan_json(response, task_id, question)
 
-        json_str = response
-        if "```json" in response:
-            json_str = response.split("```json")[1].split("```")[0].strip()
-        elif "```" in response:
-            json_str = response.split("```")[1].split("```")[0].strip()
+    def _parse_plan_from_messages(self, messages: List[Dict],
+                                   task_id: str, question: str) -> List[Dict]:
+        """Extract plan JSON from the last assistant message."""
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant" and msg.get("content"):
+                return self._parse_plan_json(msg["content"], task_id, question)
+        return [{"id": "P0", "description": question, "expected_output": "任务完成"}]
+
+    def _parse_plan_json(self, text: str, task_id: str,
+                          question: str) -> List[Dict]:
+        """Parse plan JSON from LLM response text."""
+        json_str = text
+        if "```json" in text:
+            json_str = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            json_str = text.split("```")[1].split("```")[0].strip()
 
         try:
             data = json.loads(json_str)
@@ -238,10 +501,96 @@ class ExecutionAgent(BaseAgent):
             logger.info(f"Generated {len(steps)} plan steps for {task_id}: "
                         f"{data.get('goal_analysis', '')[:100]}")
             return steps
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, AttributeError) as e:
             logger.error(f"Failed to parse plan JSON for {task_id}: {e}")
             return [{"id": "P0", "description": question,
                      "expected_output": "任务完成"}]
+
+    # ──────────────────────────────────────────────
+    #  Phase 1b: Plan Revision
+    # ──────────────────────────────────────────────
+
+    def _revise_plan(self, task_id: str, existing_plan: List[Dict],
+                     review_feedback: str, upstream_files: List[str],
+                     server_id: str, tools) -> List[Dict]:
+        """Revise an existing plan based on review feedback, with tool support."""
+        plan_text = json.dumps(existing_plan, ensure_ascii=False, indent=2)
+        tool_defs = tools.to_openai_tools()
+
+        system_msg = (
+            "你是一个工程规划专家。你需要根据审核反馈修改现有的执行计划。\n\n"
+            f"【角色定义】\n{self.system_prompt}\n"
+            f"{ENGINEERING_CONSTRAINTS}\n"
+            "【修改要求】\n"
+            "1. 仔细阅读审核反馈，理解需要修改的方面\n"
+            "2. 可以使用工具收集额外信息来支持修改\n"
+            "3. 保留原计划中合理的部分，只修改需要改进的部分\n"
+            "4. 修改后的计划必须仍然是具体、可执行的\n\n"
+            "【输出格式】\n"
+            "完成修改后，输出 JSON 格式的计划（用 ```json 包裹）：\n"
+            "```json\n"
+            '{"goal_analysis": "修改说明",\n'
+            ' "steps": [\n'
+            '   {"id": "P0", "description": "步骤描述", "expected_output": "预期产出"}\n'
+            " ]}\n"
+            "```"
+        )
+
+        user_msg = (
+            f"【任务目标】\n{task_id}\n\n"
+            f"【现有执行计划】\n{plan_text}\n\n"
+            f"【审核反馈】\n{review_feedback}"
+        )
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+
+        if not tool_defs:
+            response = llm_client.chat(messages, temperature=0.2)
+            if response:
+                return self._parse_plan_json(response, task_id, "")
+            return existing_plan
+
+        for iteration in range(_MAX_PLAN_ITERATIONS):
+            if not llm_client.client:
+                return existing_plan
+
+            response = llm_client.chat_with_tools(messages, tool_defs, temperature=0.3)
+            if response is None:
+                break
+
+            content = response.get("content", "") or ""
+            tool_calls = response.get("tool_calls")
+
+            assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
+
+            if not tool_calls:
+                break
+
+            for tc in tool_calls:
+                fn_name = tc["function"]["name"]
+                try:
+                    fn_args = json.loads(tc["function"]["arguments"])
+                except json.JSONDecodeError:
+                    fn_args = {}
+
+                tool_output = tools.call(fn_name, **fn_args)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": tool_output,
+                })
+
+        return self._parse_plan_from_messages(messages, task_id, "")
+
+    # ──────────────────────────────────────────────
+    #  Plan persistence
+    # ──────────────────────────────────────────────
 
     def _save_plan(self, plan: List[Dict], task_id: str) -> str:
         """Save plan to /data for traceability. Returns file path."""
@@ -304,6 +653,9 @@ class ExecutionAgent(BaseAgent):
     def _execute_plan(self, task_id: str, plan: List[Dict],
                       upstream_files: List[str], server_id: str) -> List[Dict]:
         """Execute each plan step via ReAct loop. Returns per-step results."""
+        tools = self._build_tool_registry(task_id, "")
+        tool_defs = tools.to_openai_tools()
+
         system_msg = self._build_exec_system_msg(upstream_files, server_id)
         system_msg += f"\n\n【当前角色】\n{self.system_prompt}"
 
@@ -334,7 +686,7 @@ class ExecutionAgent(BaseAgent):
                 if not llm_client.client:
                     raise RuntimeError("LLM client not configured")
 
-                response = llm_client.chat_with_tools(messages, TOOLS, temperature=0.3)
+                response = llm_client.chat_with_tools(messages, tool_defs, temperature=0.3)
                 if response is None:
                     step_output = "[LLM returned empty response]"
                     break
@@ -359,14 +711,7 @@ class ExecutionAgent(BaseAgent):
                     except json.JSONDecodeError:
                         fn_args = {}
 
-                    if fn_name == "run_bash":
-                        cmd = fn_args.get("command", "")
-                        timeout = fn_args.get("timeout", _DEFAULT_CMD_TIMEOUT)
-                        logger.info(f"Step {step_id} bash: {cmd[:200]}")
-                        bash_result = _execute_bash(cmd, timeout)
-                        tool_output = bash_result["output"]
-                    else:
-                        tool_output = f"[error] unknown tool: {fn_name}"
+                    tool_output = tools.call(fn_name, **fn_args)
 
                     messages.append({
                         "role": "tool",

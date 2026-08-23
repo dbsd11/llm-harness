@@ -38,6 +38,7 @@ from core import ws_protocol as P
 from core.ws_protocol import (
     parse_frame, make_frame, ack_frame, task_frame,
     TYPE_REGISTER, TYPE_STATUS, TYPE_TASK_EVENT, TYPE_TASK_RESULT, TYPE_ACK, TYPE_EVENT,
+    TYPE_ASK_ASSISTANT_REQUEST,
     EVENT_AGENT_CREATED, EVENT_TASK_STARTED,
     STATUS_IDLE, STATUS_OFFLINE,
 )
@@ -104,6 +105,8 @@ class WebSocketServer:
         self.task_server: Dict[str, str] = {}
         # server_id -> parked tasks [(scenario_id, TaskMessage, dispatch_id), ...]
         self.deferred: Dict[str, list] = {}
+        # ask_assistant correlation: task_id -> {requesting_server_id, request_id, original_task_id}
+        self.ask_assistant_correlations: Dict[str, Dict[str, str]] = {}
         # thread-safety for CentralDispatcher cross-thread access
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -340,6 +343,9 @@ class WebSocketServer:
                                 if m:
                                     await run_in_db_thread(self.message_repo.ack_message, m.id)
                                     logger.info(f"Task {ack_task_id} dispatch acked by {server_id}")
+                        elif frame_type == TYPE_ASK_ASSISTANT_REQUEST:
+                            await self._handle_ask_assistant_request(
+                                server_id, frame)
                         else:
                             logger.warning(f"未知帧类型: {frame_type}")
                     except ValueError as e:
@@ -482,6 +488,12 @@ class WebSocketServer:
             logger.error("任务结果缺少 task_id")
             return
 
+        # Check if this task_result is a response to an ask_assistant request
+        correlation = self.ask_assistant_correlations.pop(tid, None)
+        if correlation:
+            await self._route_ask_assistant_response(tid, result, correlation)
+            return
+
         # Resolve in-flight future (from forward_task)
         with self._lock:
             fut = self.pending.get(tid)
@@ -505,6 +517,169 @@ class WebSocketServer:
 
         outcome = "completed" if p.get("success") else "failed"
         logger.info(f"任务结果已转发: {tid} -> {outcome}")
+
+    async def _handle_ask_assistant_request(self, requesting_server_id: str,
+                                             frame: dict):
+        """Handle ask_assistant request from an execution agent.
+
+        Creates a task for the assistant role, dispatches it, and stores a
+        correlation so the response can be routed back to the requesting server.
+        """
+        if not requesting_server_id:
+            logger.warning("ask_assistant_request from unknown server")
+            return
+
+        p = frame.get("payload", {})
+        request_id = p.get("request_id", "")
+        question = p.get("question", "")
+        task_id = frame.get("task_id", "")
+
+        logger.info(f"ask_assistant_request from {requesting_server_id}: "
+                    f"request_id={request_id}, question={question[:100]}...")
+
+        conn = self.connections.get(requesting_server_id)
+        if not conn:
+            logger.warning(f"Requesting server {requesting_server_id} not connected")
+            return
+
+        tenant_id = conn.tenant_id
+
+        from database.repositories.scenario_repository import ScenarioRepository
+        from core.message_queue import TaskMessage
+
+        scenario_id = None
+        assistant_server_id = None
+        assistant_role = None
+        assistant_sys_prompt = ""
+
+        try:
+            task_repo_inst = self.__class__._get_task_repo()
+            task = task_repo_inst.find_by_task_id(task_id)
+            if task and task.scenario_id:
+                scenario_id = task.scenario_id
+                scenario = ScenarioRepository().find_by_scenario_id(scenario_id)
+                if scenario and scenario.config:
+                    config = json.loads(scenario.config)
+                    agent_roles = (config.get("agent_roles") or {})
+                    exec_agents = agent_roles.get("execution_agents") or []
+                    for role_cfg in exec_agents:
+                        role_desc = (role_cfg.get("role") or "").lower()
+                        role_name = (role_cfg.get("name") or "").lower()
+                        if any(kw in role_desc or kw in role_name
+                               for kw in ["助手", "审核", "评审", "human",
+                                          "assistant", "反馈"]):
+                            assistant_server_id = role_cfg.get("server_id")
+                            assistant_role = role_cfg.get("name", "")
+                            assistant_sys_prompt = role_cfg.get("role", "")
+                            break
+        except Exception as e:
+            logger.warning(f"Failed to resolve assistant for ask_assistant: {e}")
+
+        if not assistant_server_id:
+            logger.warning("No assistant server found for ask_assistant request")
+            response_frame = P.ask_assistant_response_frame(
+                task_id, request_id,
+                "[error] no assistant role configured", False)
+            if conn and conn.ws:
+                await conn.ws.send_str(response_frame)
+            return
+
+        ask_task_id = f"ask_{request_id[:8]}"
+        ask_ctx = {
+            "role": assistant_role or "assistant",
+            "system_prompt": assistant_sys_prompt or "You are a helpful assistant.",
+            "server_id": assistant_server_id,
+            "question": question,
+            "task_type": "direct_execute",
+        }
+
+        self.ask_assistant_correlations[ask_task_id] = {
+            "requesting_server_id": requesting_server_id,
+            "request_id": request_id,
+            "original_task_id": task_id,
+        }
+
+        try:
+            task_repo_inst = self.__class__._get_task_repo()
+            from database.models.task import Task
+            ask_task = Task(
+                task_id=ask_task_id,
+                parent_task_id=task_id,
+                topic_id=None,
+                scenario_id=scenario_id,
+                idempotency_key=f"{task_id}:ask_assistant_{request_id[:8]}",
+                depends_on=None,
+                goal=f"请回答以下问题：{question}",
+                state="pending",
+                priority=0,
+                timeout_seconds=300,
+                max_retries=0,
+                retry_count=0,
+                tenant_id=tenant_id,
+                context=json.dumps(ask_ctx, ensure_ascii=False),
+                created_at=datetime.now(),
+                updated_at=datetime.now(),
+            )
+            task_repo_inst.create(ask_task)
+        except Exception as e:
+            logger.error(f"Failed to create Task row for ask_assistant: {e}")
+            self.ask_assistant_correlations.pop(ask_task_id, None)
+            response_frame = P.ask_assistant_response_frame(
+                task_id, request_id,
+                f"[error] failed to create task: {e}", False)
+            if conn and conn.ws:
+                await conn.ws.send_str(response_frame)
+            return
+
+        from core.central_dispatcher import central_dispatcher
+        ask_msg = TaskMessage(
+            task_id=ask_task_id,
+            parent_task_id=task_id,
+            goal=f"请回答以下问题：{question}",
+            context=ask_ctx,
+        )
+
+        if scenario_id:
+            from core.message_queue import mqs
+            mqs.dispatch_subtasks(scenario_id, [ask_msg], max_workers=1)
+        else:
+            logger.warning(f"No scenario_id for ask_assistant task {ask_task_id}")
+            self.ask_assistant_correlations.pop(ask_task_id, None)
+            response_frame = P.ask_assistant_response_frame(
+                task_id, request_id,
+                "[error] cannot dispatch: no scenario context", False)
+            if conn and conn.ws:
+                await conn.ws.send_str(response_frame)
+
+    async def _route_ask_assistant_response(self, task_id: str, result: dict,
+                                             correlation: dict):
+        """Route an ask_assistant task result back to the requesting server."""
+        requesting_server_id = correlation["requesting_server_id"]
+        request_id = correlation["request_id"]
+        original_task_id = correlation["original_task_id"]
+
+        answer = result.get("output", "")
+        success = result.get("success", True)
+
+        conn = self.connections.get(requesting_server_id)
+        if not conn or not conn.ws:
+            logger.warning(f"Cannot route ask_assistant response: "
+                          f"server {requesting_server_id} not connected")
+            return
+
+        response_frame = P.ask_assistant_response_frame(
+            original_task_id, request_id, answer, success)
+        try:
+            await conn.ws.send_str(response_frame)
+            logger.info(f"Routed ask_assistant response to {requesting_server_id} "
+                        f"(request_id={request_id})")
+        except Exception as e:
+            logger.error(f"Failed to send ask_assistant response: {e}")
+
+    @staticmethod
+    def _get_task_repo():
+        from database.repositories.task_repository import TaskRepository
+        return TaskRepository()
 
     async def _broadcast_event(self, event_type: str, payload: dict):
         """Enqueue an event for fan-out to /subscribe subscribers.
@@ -595,6 +770,17 @@ class WebSocketServer:
             for tid in to_fail:
                 self.pending.pop(tid, None)
                 self.task_server.pop(tid, None)
+
+            # Clean up ask_assistant correlations for this server
+            stale_correlations = [
+                ask_tid for ask_tid, corr in self.ask_assistant_correlations.items()
+                if corr.get("requesting_server_id") == server_id
+            ]
+            for ask_tid in stale_correlations:
+                self.ask_assistant_correlations.pop(ask_tid, None)
+            if stale_correlations:
+                logger.info(f"Cleaned up {len(stale_correlations)} "
+                           f"ask_assistant correlation(s) for {server_id}")
 
         # Force flush: if the last heartbeat was skipped (batched), persist
         # the final state before marking offline so it isn't lost.

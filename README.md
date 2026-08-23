@@ -159,6 +159,68 @@ Execute: POST /api/workflows/{id}/execute with input_params
   → propagate failures to dependent steps
 ```
 
+### Assistant Mode (Plan-First Execution)
+
+When assistant roles are configured, the system automatically enables **assistant mode** — a plan-first execution flow where plans are reviewed before execution.
+
+```
+SchedulingAgent detects assistant roles (semantic LLM analysis)
+  → injects assistant_mode=True + task_type="generate_plan" for executor tasks
+
+ExecutionAgent (intent: generate_plan)
+  → agentic plan generation with ReAct loop + tool calls
+  → tools: run_bash (explore environment), ask_assistant (request info from assistant)
+  → returns plan with phase="plan_ready" (does NOT execute)
+
+SchedulingAgent receives plan_ready
+  → creates plan review task for assistant role
+  → dispatches to assistant's execution server
+
+ExecutionAgent (intent: direct_execute) — assistant role
+  → reviews plan, provides feedback or approval
+  → returns text review
+
+SchedulingAgent processes review
+  → if approved: creates execution task with task_type="execute_plan"
+  → if feedback: creates revision task with task_type="revise_plan" + review_feedback
+
+ExecutionAgent (intent: execute_plan or revise_plan)
+  → executes approved plan step-by-step with ReAct loop
+  → or revises plan based on feedback, then returns for re-review
+```
+
+**ask_assistant Tool**: During plan generation, execution agents can call `ask_assistant` to request supplementary information from the assistant role:
+
+```
+ExecutionAgent calls ask_assistant tool
+  → sends ask_assistant_request frame to WS server
+  → blocks on PendingAnswerStore (threading.Event)
+
+WS Server receives request
+  → creates Task row for assistant
+  → dispatches to assistant's server
+  → stores correlation: ask_task_id → {requesting_server_id, request_id}
+
+Assistant executes (intent: direct_execute)
+  → returns answer via task_result frame
+
+WS Server routes response
+  → sends ask_assistant_response frame to requesting server
+  → ExecutionAgent's ws_client resolves PendingAnswerStore
+  → ask_assistant tool returns answer to LLM
+```
+
+**Assistant Role Detection**: Roles are identified as "assistants" via semantic LLM analysis of role definitions — no new configuration fields needed. Characteristics include: reviewing plans, providing feedback, human-in-the-loop interaction. Results are cached per scenario.
+
+**Intent Detection**: Execution agents detect task intent from context:
+
+| Intent | Trigger | Behavior |
+|--------|---------|----------|
+| `generate_plan` | Default, or `task_type="generate_plan"` | Agentic plan generation with tools |
+| `execute_plan` | `task_type="execute_plan"` or context has `plan` | Execute approved plan step-by-step |
+| `revise_plan` | `task_type="revise_plan"` or context has `plan` + `review_feedback` | Revise plan based on feedback |
+| `direct_execute` | `task_type="direct_execute"` | General-purpose ReAct execution (no planning) |
+
 ## Key Properties
 
 - **Single source of truth**: ws_server owns all business data. platform has only local events/messages/human_tasks tables synced via `/subscribe`.
@@ -168,6 +230,8 @@ Execute: POST /api/workflows/{id}/execute with input_params
 - **Event-driven sync**: WSEventSubscriber listens on `/subscribe`, stores all events in local events/messages/human_tasks tables. Dashboard, Event Log, and Flask API read from these tables.
 - **Multi-tenant isolation**: all data (ws_server 12 tables + platform 8 local tables + WS broadcasts) scoped by `tenant_id`, enforced at REST, WS, and DB layers. Platform derives tenant context from its `WS_SERVER_API_KEY` JWT at startup.
 - **Workflow reuse**: completed scenarios can be published as parameterized DAG workflows and re-executed with new inputs.
+- **Plan-first execution**: when assistant roles are detected, execution agents generate plans for review before executing. Plans can be revised based on assistant feedback.
+- **Agentic tool use**: execution agents use tools (bash, ask_assistant) during both planning and execution phases via ReAct loops.
 
 ## API Key Authentication
 
@@ -303,11 +367,23 @@ llm-harness/
 │   ├── websocket_server/          # core backend: aiohttp WS+REST hub + all business logic
 │   │   ├── auth/                  # JWT API Key verification, REST middleware, WS handshake auth
 │   │   ├── core/                  # CentralDispatcher, MessageQueue, SandboxManager
+│   │   │   ├── agents/            # SchedulingAgent (assistant mode, plan review flow)
+│   │   │   ├── ws_protocol.py     # WS frame types (incl. ask_assistant_request/response)
+│   │   │   └── ...
 │   │   ├── database/              # models, repositories, migration_tenant
-│   │   ├── services/              # SchedulingAgent, ScenarioManager, SceneAssistant, WorkflowPublisher/Executor
-│   │   └── websocket_server/      # API routes (scenario, task, agent, event, chat, workflow, server, tool)
+│   │   ├── services/              # ScenarioManager, SceneAssistant, WorkflowPublisher/Executor
+│   │   └── websocket_server/      # API routes, WS hub (ask_assistant routing), event broadcast
 │   ├── agent_server_platform/     # presentation layer: Gradio UI + event sync + human-agent relay
 │   └── execution_agent_server/    # sandboxed LLM task runner (Docker)
+│       ├── execution_server/      # WS client, task runner, server entry point
+│       ├── core/
+│       │   ├── agents/
+│       │   │   └── execution_agent.py  # Intent detection, agentic planning, plan revision
+│       │   ├── pending_answer.py       # Thread-safe blocking store for ask_assistant
+│       │   ├── tool_registry.py        # Generic tool registry + OpenAI format conversion
+│       │   ├── tools.py                # BashTool, AskAssistantTool
+│       │   └── ws_protocol.py          # WS frame types (execution server side)
+│       └── ...
 ├── scripts/
 │   ├── build/                     # Dockerfiles per component
 │   └── deploy/                    # deploy.sh per component + TLS cert management
@@ -323,9 +399,9 @@ llm-harness/
 
 | Component | Path | Role | Port |
 |---|---|---|---|
-| **websocket_server** | `src/websocket_server/` | **Core backend**: 12 DB tables, JWT auth, multi-tenant isolation, SchedulingAgent, ScenarioManager, SceneAssistant, WorkflowPublisher/Executor, CentralDispatcher, REST API (38 endpoints), WS hub, event broadcast | 8765 (WS + REST) |
+| **websocket_server** | `src/websocket_server/` | **Core backend**: 12 DB tables, JWT auth, multi-tenant isolation, SchedulingAgent (assistant mode, plan review, semantic role detection), ScenarioManager, SceneAssistant, WorkflowPublisher/Executor, CentralDispatcher, REST API (38 endpoints), WS hub (ask_assistant routing), event broadcast | 8765 (WS + REST) |
 | **agent_server_platform** | `src/agent_server_platform/` | **Presentation layer**: Gradio UI (Dashboard, Scenario Dashboard, Workflow DAG, Task Monitor, Agent Registry, Execution Servers, Human Tasks, Event Log), Flask internal API (:5000 with Swagger), HumanAgentClient, WSEventSubscriber, api_client | 8080 (Gradio) + 5000 (Flask) |
-| **execution_agent_server** | `src/execution_agent_server/` | Sandboxed LLM task runner; connects to WS server, executes TASK frames | - (outbound WS) |
+| **execution_agent_server** | `src/execution_agent_server/` | Sandboxed LLM task runner; intent-aware execution (generate/execute/revise plan, direct execute), agentic planning with tools (run_bash, ask_assistant), ReAct loops | - (outbound WS) |
 
 ## Quick Start
 

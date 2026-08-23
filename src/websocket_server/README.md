@@ -93,21 +93,42 @@ docker run -d \
 
 ### 帧类型
 
+**执行服务器 → 后端:**
 - `register`: 执行服务器注册
-- `heartbeat`: 心跳检测
-- `task`: 任务分发
+- `status`: 心跳检测（状态 + 环境 + 计数）
+- `task_event`: 任务事件（execution_agent_created / task_started）
 - `task_result`: 任务结果
+- `ask_assistant_request`: 执行代理请求助手信息
+
+**后端 → 执行服务器:**
+- `task`: 任务分发
 - `ack`: 确认响应
-- `error`: 错误信息
+- `ask_assistant_response`: 助手回答返回
 
 ### 注册流程
 
 1. 执行服务器连接到 WebSocket Server
 2. 发送 `register` 帧，包含服务器信息
 3. WebSocket Server 返回 `ack` 确认
-4. 执行服务器定期发送 `heartbeat` 保持连接
+4. 执行服务器定期发送 `status` 保持连接
 5. WebSocket Server 分发 `task` 帧
 6. 执行服务器执行完成后发送 `task_result` 帧
+
+### Assistant Mode 帧流程
+
+```
+执行服务器                          WebSocket Server                         助手服务器
+    |                                    |                                    |
+    |-- ask_assistant_request --------->|                                    |
+    |   (request_id, question)          |-- create task + dispatch --------->|
+    |   [blocks on PendingAnswer]       |   (correlation stored)             |
+    |                                   |                                    |
+    |                                   |<-------- task_result -------------|
+    |                                   |   (check correlation)              |
+    |<-- ask_assistant_response -------|                                    |
+    |   (request_id, answer)            |                                    |
+    |   [PendingAnswer resolved]        |                                    |
+```
 
 ## 数据库
 

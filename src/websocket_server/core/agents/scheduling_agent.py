@@ -28,7 +28,10 @@ class SchedulingAgent(BaseAgent):
     - Idempotent task execution (retry-safe)
     - State machine transitions
     - Tool invocation for execution server management
+    - Assistant mode: plan review flow with assistant roles
     """
+
+    _assistant_role_cache = {}  # (tenant_id, role_key) -> set of assistant role names
 
     def __init__(self):
         self.task_repo = TaskRepository()
@@ -178,6 +181,17 @@ class SchedulingAgent(BaseAgent):
                 dispatched_ids: set = set()  # Track successfully dispatched tasks
                 gated = False
 
+                # Detect assistant roles for plan review flow
+                assistant_roles = self._detect_assistant_roles(configured_roles)
+                has_assistant = bool(assistant_roles)
+                assistant_role_info = None
+                if has_assistant:
+                    for role_cfg in configured_roles:
+                        if role_cfg.get("name") in assistant_roles:
+                            assistant_role_info = role_cfg
+                            break
+                    logger.info(f"Assistant mode enabled: assistant roles={assistant_roles}")
+
                 for wave_idx, wave in enumerate(waves):
                     remaining = deadline - time.time()
                     if remaining <= 0:
@@ -213,6 +227,12 @@ class SchedulingAgent(BaseAgent):
                         ctx["system_prompt"] = sys_prompt
                         if server_id:
                             ctx["server_id"] = server_id
+
+                        # Inject assistant mode for non-assistant roles
+                        if has_assistant and role not in assistant_roles:
+                            ctx["assistant_mode"] = True
+                            ctx["task_type"] = "generate_plan"
+
                         self._inject_upstream(ctx, resolved_deps, all_replies)
                         wave_msgs.append(TaskMessage(
                             task_id=tid, parent_task_id=task_id,
@@ -265,6 +285,22 @@ class SchedulingAgent(BaseAgent):
                             gated = True
                         elif not r.success:
                             failed_ids.add(r.task_id)
+
+                    # Handle plan_ready results: trigger plan review flow
+                    if has_assistant and assistant_role_info:
+                        plan_ready_tasks = []
+                        for r in replies:
+                            if r.result.get("phase") == "plan_ready":
+                                plan_ready_tasks.append(r)
+
+                        for pr in plan_ready_tasks:
+                            review_result = self._handle_plan_review(
+                                pr, assistant_role_info, scenario_id,
+                                context, deadline, configured_roles)
+                            if review_result is not None:
+                                all_replies[pr.task_id] = review_result
+                                if not review_result.get("success"):
+                                    failed_ids.add(pr.task_id)
 
                     # Handle timeout - tasks that didn't reply in time
                     replied_ids = {r.task_id for r in replies}
@@ -1135,3 +1171,255 @@ class SchedulingAgent(BaseAgent):
     def cleanup(self) -> None:
         """Cleanup resources"""
         logger.info("SchedulingAgent cleaned up")
+
+    # ──────────────────────────────────────────────
+    #  Assistant mode support
+    # ──────────────────────────────────────────────
+
+    def _detect_assistant_roles(self,
+                                 configured_roles: List[Dict[str, Any]]) -> set:
+        """Use LLM to analyze role descriptions and identify assistant roles.
+
+        An assistant role is one whose primary function is reviewing plans,
+        providing feedback, or supplementary information — rather than direct
+        task execution.
+
+        Results are cached to avoid repeated LLM calls.
+        Returns set of role names that are assistants.
+        """
+        if not configured_roles:
+            return set()
+
+        role_key = "|".join(sorted(
+            f"{r.get('name', '')}:{r.get('role', '')[:50]}"
+            for r in configured_roles
+        ))
+        cache_key = (self.tenant_id or "", role_key)
+
+        if cache_key in self._assistant_role_cache:
+            return self._assistant_role_cache[cache_key]
+
+        if not llm_client.client:
+            logger.debug("LLM not configured, skipping assistant role detection")
+            self._assistant_role_cache[cache_key] = set()
+            return set()
+
+        roles_desc = "\n".join(
+            f"- 角色名称: {r.get('name', 'unknown')}\n"
+            f"  角色定义: {r.get('role', '未定义')}"
+            for r in configured_roles
+        )
+
+        prompt = (
+            "你是一个角色分类专家。请分析以下执行代理角色，判断哪些是'助手'角色。\n\n"
+            "【助手角色的特征】\n"
+            "1. 主要职责是审核计划、提供反馈、补充信息\n"
+            "2. 角色定义中包含'审核'、'评审'、'反馈'、'建议'、'人工'、'确认'等关键词\n"
+            "3. 不直接执行具体任务（如编码、测试、部署），而是辅助其他角色\n"
+            "4. 角色名称中包含'助手'、'审核员'、'评审'、'human'等\n\n"
+            "【执行代理角色列表】\n"
+            f"{roles_desc}\n\n"
+            "请分析每个角色，判断是否为助手角色。\n"
+            "返回格式（严格遵循）：\n"
+            '```json\n{"assistant_roles": ["角色名称1", "角色名称2"]}\n```\n'
+            "如果没有助手角色，返回空数组。只返回 JSON。"
+        )
+
+        try:
+            messages = [
+                {"role": "system", "content": "你是角色分类助手，只输出 JSON。"},
+                {"role": "user", "content": prompt},
+            ]
+            response = llm_client.chat(messages, temperature=0.1)
+            if not response:
+                self._assistant_role_cache[cache_key] = set()
+                return set()
+
+            json_str = response
+            if "```json" in response:
+                json_str = response.split("```json")[1].split("```")[0].strip()
+            elif "```" in response:
+                json_str = response.split("```")[1].split("```")[0].strip()
+
+            data = json.loads(json_str)
+            assistant_names = set(data.get("assistant_roles", []))
+
+            valid_names = {r.get("name") for r in configured_roles}
+            assistant_names &= valid_names
+
+            if assistant_names:
+                logger.info(f"Detected assistant roles: {assistant_names}")
+
+            self._assistant_role_cache[cache_key] = assistant_names
+            return assistant_names
+
+        except Exception as e:
+            logger.warning(f"Assistant role detection failed: {e}")
+            self._assistant_role_cache[cache_key] = set()
+            return set()
+
+    def _handle_plan_review(self, plan_result, assistant_role_info: Dict,
+                             scenario_id: str, context: Dict[str, Any],
+                             deadline: float,
+                             configured_roles: List[Dict]) -> Optional[Dict]:
+        """Handle plan review flow: send plan to assistant, get review, dispatch execution.
+
+        Returns the final execution result, or None on failure.
+        """
+        original_task_id = plan_result.task_id
+        plan = plan_result.result.get("plan", [])
+        goal = plan_result.result.get("question", "")
+
+        if not plan:
+            logger.warning(f"plan_ready for {original_task_id} but no plan data")
+            return plan_result.result
+
+        original_task = self.task_repo.find_by_task_id(original_task_id)
+        original_ctx = {}
+        if original_task and original_task.context:
+            try:
+                original_ctx = json.loads(original_task.context)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            logger.warning("Timeout before plan review could complete")
+            return {"success": False, "error": "Plan review timeout"}
+
+        assistant_name = assistant_role_info.get("name", "")
+        assistant_sys_prompt = assistant_role_info.get("role", "")
+        assistant_server_id = assistant_role_info.get("server_id")
+
+        logger.info(f"Dispatching plan review for task {original_task_id} "
+                    f"to assistant '{assistant_name}'")
+
+        review_goal = (
+            f"请审核以下执行计划并提出反馈。\n\n"
+            f"【原始任务目标】\n{goal}\n\n"
+            f"【执行计划】\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n\n"
+            f"【审核要求】\n"
+            f"1. 检查计划是否覆盖了任务目标的所有方面\n"
+            f"2. 检查每个步骤是否具体、可执行\n"
+            f"3. 检查步骤顺序是否合理\n"
+            f"4. 如果有改进建议，请明确指出需要修改的步骤和修改内容\n"
+            f"5. 如果计划合理，回复'计划审核通过'\n\n"
+            f"【回复格式】\n"
+            f"- 如果通过：'计划审核通过'\n"
+            f"- 如果需要修改：列出具体修改建议"
+        )
+
+        review_ctx = {
+            "role": assistant_name,
+            "system_prompt": assistant_sys_prompt,
+            "task_type": "direct_execute",
+            "question": review_goal,
+        }
+        if assistant_server_id:
+            review_ctx["server_id"] = assistant_server_id
+
+        review_task_id = str(uuid.uuid4())
+        review_task = Task(
+            task_id=review_task_id,
+            parent_task_id=original_task_id,
+            topic_id=None,
+            scenario_id=scenario_id,
+            idempotency_key=f"{original_task_id}:plan_review",
+            depends_on=None,
+            goal=review_goal,
+            state=TaskState.PENDING.value,
+            priority=0,
+            timeout_seconds=min(int(remaining), 300),
+            max_retries=1,
+            retry_count=0,
+            tenant_id=self.tenant_id,
+            context=json.dumps(review_ctx, ensure_ascii=False),
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        self.task_repo.create(review_task)
+
+        review_msg = TaskMessage(
+            task_id=review_task_id,
+            parent_task_id=original_task_id,
+            goal=review_goal,
+            context=review_ctx,
+        )
+        mqs.dispatch_subtasks(scenario_id, [review_msg], max_workers=1)
+
+        review_timeout = max(int(min(remaining, 300)), 30)
+        review_replies = mqs.collect_replies(
+            scenario_id, 1, timeout=review_timeout,
+            expected_task_ids=[review_task_id])
+
+        if not review_replies:
+            logger.warning(f"Plan review timeout for task {original_task_id}")
+            return {"success": False, "error": "Plan review timeout"}
+
+        review_output = review_replies[0].result.get("output", "")
+        logger.info(f"Plan review result for {original_task_id}: "
+                    f"{review_output[:200]}...")
+
+        approved = self._is_plan_approved(review_output)
+
+        exec_task_id = str(uuid.uuid4())
+        if approved:
+            exec_ctx = dict(original_ctx)
+            exec_ctx["task_type"] = "execute_plan"
+            exec_ctx["plan"] = plan
+            exec_ctx.pop("review_feedback", None)
+            exec_goal = goal
+        else:
+            exec_ctx = dict(original_ctx)
+            exec_ctx["task_type"] = "revise_plan"
+            exec_ctx["plan"] = plan
+            exec_ctx["review_feedback"] = review_output
+            exec_goal = f"{goal} (根据审核反馈修正)"
+
+        exec_task = Task(
+            task_id=exec_task_id,
+            parent_task_id=original_task_id,
+            topic_id=None,
+            scenario_id=scenario_id,
+            idempotency_key=f"{original_task_id}:plan_execution",
+            depends_on=None,
+            goal=exec_goal,
+            state=TaskState.PENDING.value,
+            priority=0,
+            timeout_seconds=max(int(deadline - time.time()), 60),
+            max_retries=1,
+            retry_count=0,
+            tenant_id=self.tenant_id,
+            context=json.dumps(exec_ctx, ensure_ascii=False),
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        self.task_repo.create(exec_task)
+
+        exec_msg = TaskMessage(
+            task_id=exec_task_id,
+            parent_task_id=original_task_id,
+            goal=exec_goal,
+            context=exec_ctx,
+        )
+        mqs.dispatch_subtasks(scenario_id, [exec_msg], max_workers=1)
+
+        exec_timeout = max(int(deadline - time.time()), 60)
+        exec_replies = mqs.collect_replies(
+            scenario_id, 1, timeout=exec_timeout,
+            expected_task_ids=[exec_task_id])
+
+        if not exec_replies:
+            logger.warning(f"Plan execution timeout for task {exec_task_id} "
+                          f"(original: {original_task_id})")
+            return {"success": False, "error": "Plan execution timeout after review"}
+
+        return exec_replies[0].result
+
+    @staticmethod
+    def _is_plan_approved(review_output: str) -> bool:
+        """Determine if the plan review indicates approval."""
+        approval_keywords = ["审核通过", "计划通过", "通过", "approve", "approved",
+                            "looks good", "no changes", "没有问题", "可以执行"]
+        output_lower = review_output.lower()
+        return any(kw in output_lower for kw in approval_keywords)

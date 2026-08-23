@@ -8,11 +8,18 @@ TYPE_REGISTER = "register"        # one-time on connect
 TYPE_STATUS = "status"            # periodic heartbeat (status + env + counts)
 TYPE_TASK_EVENT = "task_event"    # execution_agent_created / task_started
 TYPE_TASK_RESULT = "task_result"  # terminal reply for a task
+TYPE_PLAN_RESULT = "plan_result"  # execution agent returns plan for review
+TYPE_ASK_ASSISTANT_REQUEST = "ask_assistant_request"  # exec agent asks assistant
 
 # Frame types: backend -> execution-server
 TYPE_TASK = "task"                # dispatch a task to be executed
 TYPE_ACK = "ack"                  # acknowledge register / task receipt
 TYPE_EVENT = "event"              # backend -> subscriber broadcast
+TYPE_ASK_ASSISTANT_RESPONSE = "ask_assistant_response"  # backend returns assistant answer
+
+# task_result phase values (in result dict) — assistant mode flow
+PHASE_PLAN_READY = "plan_ready"    # plan generated, awaiting review
+PHASE_REVISION = "revision"        # revised plan, awaiting re-review
 
 # task_event sub-events
 EVENT_AGENT_CREATED = "execution_agent_created"
@@ -103,6 +110,38 @@ def ack_frame(ok: bool = True, error: Optional[str] = None,
     if error:
         payload["error"] = error
     return make_frame(TYPE_ACK, payload, task_id=task_id)
+
+
+def plan_result_frame(task_id: str, plan: list, goal: str,
+                      phase: str = PHASE_PLAN_READY) -> str:
+    """Execution agent returns generated plan for assistant review."""
+    return make_frame(TYPE_PLAN_RESULT, {
+        "task_id": task_id,
+        "plan": plan,
+        "goal": goal,
+        "phase": phase,
+    }, task_id=task_id)
+
+
+def ask_assistant_request_frame(task_id: str, request_id: str,
+                                question: str,
+                                context_summary: str = "") -> str:
+    """Execution agent requests supplementary info from assistant."""
+    return make_frame(TYPE_ASK_ASSISTANT_REQUEST, {
+        "request_id": request_id,
+        "question": question,
+        "context_summary": context_summary,
+    }, task_id=task_id)
+
+
+def ask_assistant_response_frame(task_id: str, request_id: str,
+                                 answer: str, success: bool = True) -> str:
+    """Backend returns assistant's answer to execution agent."""
+    return make_frame(TYPE_ASK_ASSISTANT_RESPONSE, {
+        "request_id": request_id,
+        "answer": answer,
+        "success": success,
+    }, task_id=task_id)
 
 
 if __name__ == "__main__":

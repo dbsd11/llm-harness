@@ -35,6 +35,7 @@ class TaskRunner:
 
         role = context.get("role", "通用助手")
         system_prompt = context.get("system_prompt", "你是一个有帮助的智能助手。")
+        assistant_mode = context.get("assistant_mode", False)
 
         agent = ExecutionAgent()
         try:
@@ -42,7 +43,12 @@ class TaskRunner:
             self.ws_client.send(P.task_event_frame(
                 task_id, P.EVENT_AGENT_CREATED, role=role))
 
-            agent.initialize({"role": role, "system_prompt": system_prompt})
+            agent.initialize({
+                "role": role,
+                "system_prompt": system_prompt,
+                "ws_client": self.ws_client,
+                "assistant_mode": assistant_mode,
+            })
 
             # event: task started
             self.ws_client.send(P.task_event_frame(task_id, P.EVENT_TASK_STARTED))

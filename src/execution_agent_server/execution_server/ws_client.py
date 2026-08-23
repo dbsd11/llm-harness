@@ -97,6 +97,13 @@ class WSClient:
                 ack = frame["payload"]
                 if not ack.get("ok"):
                     logger.warning(f"Backend NACK: {ack.get('error')}")
+            elif t == P.TYPE_ASK_ASSISTANT_RESPONSE:
+                p = frame["payload"]
+                request_id = p.get("request_id", "")
+                answer = p.get("answer", "")
+                success = p.get("success", True)
+                from core.pending_answer import pending_answers
+                pending_answers.resolve(request_id, answer, success)
             else:
                 logger.debug(f"Exec server received frame: {t}")
 
