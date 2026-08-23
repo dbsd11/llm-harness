@@ -1534,9 +1534,19 @@ class SchedulingAgent(BaseAgent):
 
         remaining_waves = waves[wave_idx + 1:]
         remaining_goals = []
+        old_remaining_task_ids = []
         for w in remaining_waves:
             for sub in w:
                 remaining_goals.append(sub.get("goal", ""))
+                real_tid = local_id_to_task_id.get(sub["id"])
+                if real_tid:
+                    old_remaining_task_ids.append(real_tid)
+
+        for old_tid in old_remaining_task_ids:
+            try:
+                self.task_repo.mark_as_cancelled(old_tid, "Superseded by heuristic regeneration")
+            except Exception as e:
+                logger.warning(f"Failed to cancel superseded task {old_tid}: {e}")
 
         logger.info(
             f"Heuristic check triggered after wave {wave_idx}: "

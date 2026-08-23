@@ -298,7 +298,15 @@ class ScenarioManager:
                     wait_timeout = int(wait_timeout)
                 except ValueError:
                     wait_timeout = 3600
-            self._wait_for_scenario_tasks(scenario_id, timeout=wait_timeout)
+            all_terminal = self._wait_for_scenario_tasks(scenario_id, timeout=wait_timeout)
+            if not all_terminal:
+                from database.repositories.task_repository import TaskRepository
+                _task_repo = TaskRepository()
+                for t in _task_repo.find_by_scenario_id(scenario_id):
+                    if t.state not in TASK_TERMINAL_STATES:
+                        _task_repo.mark_as_failed(t.task_id, "Cancelled: scenario wait timeout")
+                logger.warning(f"Scenario {scenario_id}: force-failed remaining "
+                               f"non-terminal tasks after wait timeout")
 
             if config.get("manual_acceptance"):
                 # Manual acceptance: cycle 1 paused or completed-with-no-tasks.
