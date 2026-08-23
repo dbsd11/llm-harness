@@ -109,6 +109,20 @@ class SchedulingAgent(BaseAgent):
                 manual_acceptance = False
 
         try:
+            # Detect assistant roles EARLY so we can exclude them from
+            # the decomposition prompt's available role list.
+            agent_roles_cfg = context.get("agent_roles") or {}
+            configured_roles = agent_roles_cfg.get("execution_agents") or []
+            assistant_roles = self._detect_assistant_roles(configured_roles)
+            has_assistant = bool(assistant_roles)
+            assistant_role_info = None
+            if has_assistant:
+                for role_cfg in configured_roles:
+                    if role_cfg.get("name") in assistant_roles:
+                        assistant_role_info = role_cfg
+                        break
+                logger.info(f"Assistant mode enabled: assistant roles={assistant_roles}")
+
             if resume_cycle and scenario_id:
                 # Resume mode: load existing tasks, derive corrective tasks
                 topic_id = str(uuid.uuid4())
@@ -143,8 +157,23 @@ class SchedulingAgent(BaseAgent):
                     context["planning_insights"] = planning_insights
                     logger.info(f"Planning insights collected ({len(planning_insights)} chars)")
                 logger.info(f"Starting goal decomposition for task {task_id}")
+                context = dict(context)
+                context["_assistant_roles"] = assistant_roles
                 subtasks = self._decompose_goal(goal, context)
                 subtasks = self._normalize_subtasks(subtasks)
+                # Safety net: reassign any subtask that still got an assistant role
+                exec_roles = [r for r in configured_roles if r.get("name") not in assistant_roles]
+                if assistant_roles and exec_roles:
+                    first_exec = exec_roles[0]
+                    for sub in subtasks:
+                        sub_role = (sub.get("context") or {}).get("role", "")
+                        if sub_role in assistant_roles:
+                            logger.warning(
+                                f"Subtask '{sub.get('id')}' was assigned to assistant "
+                                f"role '{sub_role}'; reassigning to '{first_exec.get('name')}'"
+                            )
+                            sub.setdefault("context", {})["role"] = first_exec.get("name", "")
+                            sub["context"]["system_prompt"] = first_exec.get("role", "")
                 logger.info(f"Goal decomposition completed: {len(subtasks)} subtasks created")
 
                 local_id_to_task_id: Dict[str, str] = {}
@@ -174,25 +203,16 @@ class SchedulingAgent(BaseAgent):
                 agent_roles_cfg = context.get("agent_roles") or {}
                 configured_roles = agent_roles_cfg.get("execution_agents") or []
                 max_workers = context.get("max_workers", 3)
-                total_timeout = context.get("timeout_seconds", 300)
+                total_timeout = context.get("timeout_seconds") or context.get("timeout", 300)
                 deadline = time.time() + total_timeout
                 all_replies: Dict[str, dict] = {}
                 failed_ids: set = set()
                 dispatched_ids: set = set()  # Track successfully dispatched tasks
                 gated = False
 
-                # Detect assistant roles for plan review flow
-                assistant_roles = self._detect_assistant_roles(configured_roles)
-                has_assistant = bool(assistant_roles)
-                assistant_role_info = None
-                if has_assistant:
-                    for role_cfg in configured_roles:
-                        if role_cfg.get("name") in assistant_roles:
-                            assistant_role_info = role_cfg
-                            break
-                    logger.info(f"Assistant mode enabled: assistant roles={assistant_roles}")
-
-                for wave_idx, wave in enumerate(waves):
+                wave_idx = 0
+                while wave_idx < len(waves):
+                    wave = waves[wave_idx]
                     remaining = deadline - time.time()
                     if remaining <= 0:
                         logger.warning(f"SchedulingAgent: timeout before wave {wave_idx}")
@@ -342,6 +362,23 @@ class SchedulingAgent(BaseAgent):
                             "replies": all_replies,
                         }
 
+                    # Heuristic check: evaluate results and regenerate DAG if needed
+                    new_waves = self._heuristic_wave_check(
+                        wave_idx=wave_idx, waves=waves,
+                        wave_dispatched=wave_dispatched, replies=replies,
+                        all_replies=all_replies, failed_ids=failed_ids,
+                        local_id_to_task_id=local_id_to_task_id,
+                        created_by_id=created_by_id,
+                        context=context, configured_roles=configured_roles,
+                        assistant_roles=assistant_roles,
+                    )
+                    if new_waves is not None:
+                        waves = waves[:wave_idx + 1] + new_waves
+                        logger.info(f"Waves updated: {len(waves)} total "
+                                    f"({wave_idx + 1} done + {len(new_waves)} new)")
+
+                    wave_idx += 1
+
                 event_bus.emit("task.scheduled", {
                     "task_id": task_id,
                     "topic_id": topic_id,
@@ -396,7 +433,7 @@ class SchedulingAgent(BaseAgent):
 
         Returns timeout in seconds.
         """
-        base_timeout = context.get("timeout_seconds", 3600)
+        base_timeout = context.get("timeout_seconds") or context.get("timeout", 3600)
         goal = subtask.get("goal", "").lower()
 
         # Environment setup tasks - typically fast
@@ -876,7 +913,7 @@ class SchedulingAgent(BaseAgent):
         if scenario_id:
             user_parts.append(f"场景 ID：{scenario_id}")
         priority = context.get("priority", 0)
-        timeout = context.get("timeout_seconds", 3600)
+        timeout = context.get("timeout_seconds") or context.get("timeout", 3600)
         user_parts.append(f"优先级：{priority}，超时：{timeout}s")
 
         messages = [
@@ -945,7 +982,7 @@ class SchedulingAgent(BaseAgent):
             List of subtask dicts
         """
         priority = context.get("priority", 0)
-        timeout = context.get("timeout_seconds", 3600)
+        timeout = context.get("timeout_seconds") or context.get("timeout", 3600)
         exec_context = context.get("execution_context", {})
 
         logger.info(f"Attempting goal decomposition for: {goal[:100]}...")
@@ -954,9 +991,16 @@ class SchedulingAgent(BaseAgent):
         # from them (rather than inventing names that won't route).
         configured_roles = (context.get("agent_roles") or {}).get(
             "execution_agents", []) or []
+        assistant_roles = context.get("_assistant_roles") or set()
         if configured_roles:
+            exec_role_names = [
+                r.get("name", "") for r in configured_roles
+                if r.get("name", "") not in assistant_roles
+            ]
             context = dict(context)
-            context["execution_role_names"] = [r.get("name", "") for r in configured_roles]
+            context["execution_role_names"] = exec_role_names
+            if assistant_roles:
+                context["assistant_role_names"] = list(assistant_roles)
 
         # 优先使用大模型进行智能分解
         if llm_client.client:
@@ -1113,7 +1157,7 @@ class SchedulingAgent(BaseAgent):
             goal=goal,
             state=TaskState.PENDING.value,
             priority=context.get("priority", 0) if context else 0,
-            timeout_seconds=context.get("timeout_seconds", 3600) if context else 3600,
+            timeout_seconds=(context.get("timeout_seconds") or context.get("timeout", 3600)) if context else 3600,
             max_retries=3,
             retry_count=0,
             tenant_id=self.tenant_id,
@@ -1415,6 +1459,136 @@ class SchedulingAgent(BaseAgent):
             return {"success": False, "error": "Plan execution timeout after review"}
 
         return exec_replies[0].result
+
+    def _heuristic_wave_check(
+        self, wave_idx: int, waves: List[List[Dict]],
+        wave_dispatched: List[str], replies: list,
+        all_replies: Dict[str, dict], failed_ids: set,
+        local_id_to_task_id: Dict[str, str],
+        created_by_id: Dict[str, tuple],
+        context: Dict[str, Any], configured_roles: List[Dict],
+        assistant_roles: set,
+    ) -> Optional[List[List[Dict]]]:
+        """Evaluate wave results and regenerate remaining DAG if needed.
+
+        Called after each wave completes (post plan_review). If any task's
+        output is judged invalid (e.g. code-only text without actual execution),
+        the remaining waves are replaced with LLM-regenerated tasks.
+
+        Returns new waves list if regeneration happened, else None.
+        """
+        if not llm_client.client:
+            return None
+
+        original_goal = context.get("goal", "")
+
+        completed_results = []
+        failed_info = []
+        wave_had_invalid = False
+
+        for r in replies:
+            tid = r.task_id
+            sub_info = None
+            for lid, (real_tid, sub) in created_by_id.items():
+                if real_tid == tid:
+                    sub_info = sub
+                    break
+
+            role = ""
+            if sub_info:
+                role = (sub_info.get("context") or {}).get("role", "")
+
+            if role in assistant_roles:
+                continue
+
+            output = r.result.get("output", "") if isinstance(r.result, dict) else ""
+            goal = (sub_info or {}).get("goal", "") if sub_info else ""
+
+            if r.success and output:
+                evaluation = llm_client.evaluate_task_output(goal, output, role)
+                if not evaluation.get("valid", True):
+                    logger.warning(
+                        f"Heuristic check: task {tid} output invalid — "
+                        f"{evaluation.get('reason', '')}")
+                    wave_had_invalid = True
+                    failed_ids.add(tid)
+                    failed_info.append({
+                        "goal": goal,
+                        "output": output[:500],
+                        "reason": evaluation.get("reason", ""),
+                    })
+                else:
+                    completed_results.append({
+                        "goal": goal, "output": output[:500],
+                        "success": True, "role": role,
+                    })
+            elif not r.success:
+                failed_info.append({
+                    "goal": goal,
+                    "output": (r.result.get("output", "") if isinstance(r.result, dict) else "")[:500],
+                    "reason": r.result.get("error", "unknown") if isinstance(r.result, dict) else "failed",
+                })
+
+        if not wave_had_invalid:
+            return None
+
+        remaining_waves = waves[wave_idx + 1:]
+        remaining_goals = []
+        for w in remaining_waves:
+            for sub in w:
+                remaining_goals.append(sub.get("goal", ""))
+
+        logger.info(
+            f"Heuristic check triggered after wave {wave_idx}: "
+            f"{len(failed_info)} invalid task(s), "
+            f"{len(remaining_goals)} remaining goal(s) to replan")
+
+        exec_only_roles = [
+            r for r in configured_roles if r.get("name") not in assistant_roles
+        ]
+        new_subtasks = llm_client.regenerate_remaining_tasks(
+            original_goal=original_goal,
+            completed_results=completed_results,
+            remaining_goals=remaining_goals,
+            failed_info=failed_info,
+            configured_roles=exec_only_roles or configured_roles,
+            context=context,
+        )
+
+        if not new_subtasks:
+            logger.warning("Heuristic check: LLM regeneration returned empty, "
+                           "keeping original DAG")
+            return None
+
+        new_id_map = {}
+        for sub in new_subtasks:
+            lid = sub["id"]
+            real_tid = str(uuid.uuid4())
+            new_id_map[lid] = real_tid
+            sub["_real_task_id"] = real_tid
+
+        for sub in new_subtasks:
+            sub["depends_on"] = [
+                new_id_map.get(d, d) for d in sub.get("depends_on", [])
+            ]
+
+        try:
+            new_waves = self._build_waves(new_subtasks)
+        except ValueError as e:
+            logger.error(f"Heuristic check: failed to build waves from "
+                         f"regenerated tasks: {e}")
+            return None
+
+        for sub in new_subtasks:
+            real_tid = sub.pop("_real_task_id")
+            lid = sub["id"]
+            local_id_to_task_id[lid] = real_tid
+            created_by_id[lid] = (real_tid, sub)
+
+        logger.info(f"Heuristic check: replaced {len(remaining_goals)} remaining "
+                     f"goals with {len(new_subtasks)} new tasks in "
+                     f"{len(new_waves)} wave(s)")
+        return new_waves
 
     @staticmethod
     def _is_plan_approved(review_output: str) -> bool:

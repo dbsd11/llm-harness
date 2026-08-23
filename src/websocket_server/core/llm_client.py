@@ -74,6 +74,34 @@ class LLMClient:
             logger.error(f"LLM call failed after {elapsed_time:.2f}s: {str(e)}")
             return None
 
+    @staticmethod
+    def _extract_json(text: str) -> Optional[Any]:
+        """Extract JSON object/array from LLM response text."""
+        if not text:
+            return None
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0].strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    return json.loads(text[start:end + 1])
+                except json.JSONDecodeError:
+                    pass
+            start = text.find("[")
+            end = text.rfind("]")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    return json.loads(text[start:end + 1])
+                except json.JSONDecodeError:
+                    pass
+            return None
+
     def chat_with_tools(self, messages: List[Dict], tools: List[Dict],
                         temperature: float = 0.7) -> Optional[Dict[str, Any]]:
         """Send a chat request with tool definitions (OpenAI function calling).
@@ -152,15 +180,25 @@ class LLMClient:
         # If the scenario configured execution-agent roles, constrain the LLM
         # to pick role names from that list so tasks associate + route correctly.
         role_names = context.get("execution_role_names") or []
+        assistant_role_names = context.get("assistant_role_names") or []
         if role_names:
             names_str = "、".join(role_names)
             role_constraint = (
-                f"5. **每个子任务的 context.role 必须从以下已配置的角色名称中选择，"
+                f"5. **每个子任务的 context.role 必须从以下已配置的执行角色名称中选择，"
                 f"不得自创名称**：{names_str}\n"
                 f"   若目标只需单一角色，所有子任务的 role 都设为其中合适的一个。"
             )
         else:
             role_constraint = ""
+
+        if assistant_role_names:
+            assistant_names_str = "、".join(assistant_role_names)
+            role_constraint += (
+                f"\n6. **以下角色是人工助理角色，仅用于审核计划和回答补充问题，"
+                f"绝对不能分配执行任务**：{assistant_names_str}\n"
+                f"   这些角色不执行具体任务（如搜索、编码、数据分析等），"
+                f"所有需要实际执行的子任务必须分配给上述执行角色。"
+            )
 
         # Build execution environment section from connected servers' env_info.
         execution_env = context.get("execution_env") or []
@@ -315,7 +353,7 @@ class LLMClient:
                     "goal": task["goal"],
                     "type": task.get("type", "execution"),
                     "priority": task.get("priority", context.get("priority", 0)),
-                    "timeout_seconds": task.get("timeout_seconds", context.get("timeout_seconds", 3600)),
+                    "timeout_seconds": task.get("timeout_seconds", context.get("timeout_seconds") or context.get("timeout", 3600)),
                     "depends_on": deps,
                     "context": task.get("context", {})
                 }
@@ -365,7 +403,7 @@ class LLMClient:
                 "goal": retry_goal,
                 "type": "execution",
                 "priority": context.get("priority", 0),
-                "timeout_seconds": context.get("timeout_seconds", 3600),
+                "timeout_seconds": context.get("timeout_seconds") or context.get("timeout", 3600),
                 "depends_on": rejected_deps,
                 "context": {
                     "role": "通用助手",
@@ -382,7 +420,7 @@ class LLMClient:
                     "goal": dep.get("goal", ""),
                     "type": dep.get("type", "execution"),
                     "priority": dep.get("priority", context.get("priority", 0)),
-                    "timeout_seconds": dep.get("timeout_seconds", context.get("timeout_seconds", 3600)),
+                    "timeout_seconds": dep.get("timeout_seconds", context.get("timeout_seconds") or context.get("timeout", 3600)),
                     "depends_on": ["t1"],  # depend on the retry task
                     "context": dep.get("context", {}),
                 }
@@ -537,7 +575,7 @@ class LLMClient:
                     "goal": task["goal"],
                     "type": task.get("type", "execution"),
                     "priority": task.get("priority", context.get("priority", 0)),
-                    "timeout_seconds": task.get("timeout_seconds", context.get("timeout_seconds", 3600)),
+                    "timeout_seconds": task.get("timeout_seconds", context.get("timeout_seconds") or context.get("timeout", 3600)),
                     "depends_on": deps,
                     "context": task.get("context", {}),
                 }
@@ -553,6 +591,182 @@ class LLMClient:
         except Exception as e:
             logger.error(f"derive_followup_tasks failed: {e}, using fallback")
             return _fallback()
+
+    def evaluate_task_output(self, task_goal: str, output: str,
+                             role: str = "") -> Dict[str, Any]:
+        """Evaluate whether a task output is substantive or just text/code.
+
+        Returns:
+            {
+                "valid": bool,          # True if output is substantive
+                "reason": str,          # Why it's valid or invalid
+                "suggestion": str,      # How to fix if invalid
+            }
+        """
+        if not self.client:
+            return {"valid": True, "reason": "LLM not available, skipping evaluation",
+                    "suggestion": ""}
+
+        if not output or len(output.strip()) < 20:
+            return {"valid": False,
+                    "reason": "输出为空或过短",
+                    "suggestion": "重新执行任务，确保通过工具实际执行操作"}
+
+        role_hint = f"该角色的定义是：{role}。" if role else ""
+
+        prompt = f"""你是一个任务质量评估专家。请判断以下任务的执行结果是否有效。
+
+【任务目标】
+{task_goal}
+
+{role_hint}
+
+【执行结果】
+{output[:3000]}
+
+【评估标准】
+1. 输出是否实际完成了任务目标（而非只提供方案/代码/建议）
+2. 输出是否包含实际执行后的真实数据/结果（而非示例/模板/占位符）
+3. 如果任务要求执行脚本或命令，输出是否包含执行结果（而非只输出代码）
+4. 输出是否有实质内容（而非拒绝执行或说"我无法做到"）
+
+请以 JSON 格式回复：
+```json
+{{"valid": true/false, "reason": "判断理由", "suggestion": "如果无效，给出改进建议"}}
+```"""
+
+        try:
+            messages = [{"role": "user", "content": prompt}]
+            response = self.chat(messages, temperature=0.1)
+            if not response:
+                return {"valid": True, "reason": "评估返回空，默认通过", "suggestion": ""}
+
+            result = self._extract_json(response)
+            if result and isinstance(result, dict):
+                return {
+                    "valid": bool(result.get("valid", True)),
+                    "reason": str(result.get("reason", "")),
+                    "suggestion": str(result.get("suggestion", "")),
+                }
+            return {"valid": True, "reason": "无法解析评估结果", "suggestion": ""}
+        except Exception as e:
+            logger.error(f"evaluate_task_output failed: {e}")
+            return {"valid": True, "reason": f"评估异常: {e}", "suggestion": ""}
+
+    def regenerate_remaining_tasks(
+        self, original_goal: str, completed_results: List[Dict[str, Any]],
+        remaining_goals: List[str], failed_info: List[Dict[str, Any]],
+        configured_roles: List[Dict[str, Any]],
+        context: Dict[str, Any],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Regenerate remaining tasks based on actual progress.
+
+        Args:
+          original_goal: The original scenario goal.
+          completed_results: [{goal, output, success, role}, ...] for completed tasks.
+          remaining_goals: [goal, ...] for tasks not yet executed.
+          failed_info: [{goal, output, reason}, ...] for failed/invalid tasks.
+          configured_roles: Available role definitions.
+          context: Scenario context.
+
+        Returns:
+          List of subtask dicts in the same shape as decompose_goal output,
+          or None if LLM is unavailable.
+        """
+        if not self.client:
+            return None
+
+        role_desc = "\n".join(
+            f"- {r.get('name', '')}: {r.get('description', '')}"
+            for r in configured_roles
+        )
+
+        completed_summary = ""
+        for cr in completed_results:
+            status = "成功" if cr.get("success") else "失败"
+            completed_summary += (
+                f"\n【{status}】{cr.get('goal', '')}\n"
+                f"角色: {cr.get('role', '')}\n"
+                f"输出摘要: {(cr.get('output', '') or '')[:500]}\n"
+            )
+
+        failed_summary = ""
+        for fi in failed_info:
+            failed_summary += (
+                f"\n【失败】{fi.get('goal', '')}\n"
+                f"原因: {fi.get('reason', '')}\n"
+                f"输出: {(fi.get('output', '') or '')[:300]}\n"
+            )
+
+        remaining_summary = "\n".join(
+            f"- {g}" for g in remaining_goals
+        ) if remaining_goals else "(无)"
+
+        timeout = context.get("timeout_seconds") or context.get("timeout", 3600)
+
+        prompt = f"""你是一个任务调度专家。当前任务执行出现了偏差，需要根据实际进展重新规划剩余任务。
+
+【原始目标】
+{original_goal}
+
+【可用角色】
+{role_desc}
+
+【已完成任务】
+{completed_summary or "(无)"}
+
+【失败/无效任务】
+{failed_summary or "(无)"}
+
+【原计划剩余任务（需要重新规划）】
+{remaining_summary}
+
+【要求】
+1. 根据已完成和失败的任务结果，重新规划剩余工作
+2. 如果已完成的任务结果无效（如只输出了代码而没有实际执行），需要重新安排执行任务
+3. 确保任务分配给正确的角色（不要把执行类任务分配给审核/助手类角色）
+4. 每个任务必须指定一个可用的角色
+5. 任务之间用 depends_on 建立依赖关系
+
+请以 JSON 格式回复：
+```json
+{{"analysis": "当前进展分析",
+  "steps": [
+    {{"id": "r1", "goal": "任务描述", "depends_on": [],
+      "context": {{"role": "角色名", "system_prompt": "角色系统提示", "question": "具体问题"}}}}
+  ]}}
+```"""
+
+        try:
+            messages = [{"role": "user", "content": prompt}]
+            response = self.chat(messages, temperature=0.2)
+            if not response:
+                return None
+
+            result = self._extract_json(response)
+            if not result or "steps" not in result:
+                logger.warning("regenerate_remaining_tasks: LLM returned no steps")
+                return None
+
+            steps = result["steps"]
+            if not isinstance(steps, list) or not steps:
+                return None
+
+            for i, step in enumerate(steps):
+                step.setdefault("id", f"r{i + 1}")
+                step.setdefault("type", "execution")
+                step.setdefault("priority", 0)
+                step.setdefault("timeout_seconds", timeout)
+                step.setdefault("depends_on", [])
+                step.setdefault("context", {})
+
+            logger.info(f"Regenerated {len(steps)} remaining tasks: "
+                        f"{result.get('analysis', '')[:200]}")
+            return steps
+
+        except Exception as e:
+            logger.error(f"regenerate_remaining_tasks failed: {e}")
+            return None
 
 
 # 全局单例

@@ -159,12 +159,17 @@ echo "[5/8] 构建镜像 (requirements.txt 未变则 pip 层缓存命中)"
 cd "$BUILD_DIR"
 sudo docker build -t "$IMAGE" .
 
+DATA_DIR="${DATA_DIR:-/agent-data-files/agent-platform}"
+sudo mkdir -p "$DATA_DIR"
+
 echo "[6/8] 启动新容器 (--env-file 复用环境 + wss 覆盖)"
 sudo docker run -d \
   --name "$CONTAINER" \
   --network host \
   --restart unless-stopped \
   --env-file "$ENV_FILE" \
+  -v ${DATA_DIR}:/data \
+  -e DB_NAME=/data/agent_server.db \
   -e WS_SERVER_API_URL=https://agent-socket-server.bdzz.com.cn:8765 \
   -e WS_SERVER_WS_URL=wss://agent-socket-server.bdzz.com.cn:8765 \
   -e SANDBOX_BACKEND_WS_URL=wss://agent-socket-server.bdzz.com.cn:8765 \

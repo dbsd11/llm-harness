@@ -151,7 +151,7 @@ def create_page(global_state_component):
         with gr.Row():
             identity = gr.Textbox(
                 label="Human Agent 身份（server_id）",
-                value=os.getenv("HUMAN_AGENT_DEFAULT_ID", "human-1"),
+                value=os.getenv("HUMAN_AGENT_DEFAULT_ID", "human-test"),
                 elem_id="ha-identity",
                 interactive=True,
             )

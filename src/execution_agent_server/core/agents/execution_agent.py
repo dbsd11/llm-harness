@@ -280,7 +280,7 @@ class ExecutionAgent(BaseAgent):
             f"你是一个智能助手。你的角色是：{self.role}\n\n"
             f"【角色定义】\n{self.system_prompt}\n\n"
             "请根据用户的问题，使用可用工具收集必要信息后给出完整回答。\n"
-            "如果需要执行命令来获取信息，请使用 run_bash 工具。\n"
+            "如果需要执行操作来获取信息，请使用对应的工具。\n"
             "回答应直接、完整、有用。"
         )
         if server_id:
@@ -391,7 +391,7 @@ class ExecutionAgent(BaseAgent):
             f"{ENGINEERING_CONSTRAINTS}\n"
             "【规划流程】\n"
             "1. 分析任务目标，确定需要哪些额外信息\n"
-            "2. 使用工具（如 run_bash 探索环境、ask_assistant 请求补充信息）收集必要信息\n"
+            "2. 使用可用工具（如探索环境、ask_assistant 请求补充信息）收集必要信息\n"
             "3. 基于收集的信息，生成精简的执行计划\n"
             "4. 计划确定后，直接输出 JSON 格式的计划\n\n"
             "【规划要求】\n"
@@ -613,40 +613,50 @@ class ExecutionAgent(BaseAgent):
     #  Phase 2: Execute
     # ──────────────────────────────────────────────
 
-    def _build_exec_system_msg(self, upstream_files: List[str], server_id: str) -> str:
+    def _build_exec_system_msg(self, upstream_files: List[str], server_id: str,
+                               assistant_mode: bool = False) -> str:
         """Static execution framework (shared across ALL tasks → prefix cache)."""
         msg = (
-            "你是一个命令执行 Agent，通过 run_bash 工具在服务器 shell 中执行命令来完成任务。\n\n"
-            "【执行规则】\n"
-            "1. 必须使用 run_bash 工具实际执行命令，禁止只提供命令示例而不执行\n"
-            "2. 禁止只解释如何使用命令而不实际调用工具\n"
-            "3. 禁止说'我无法执行'或'建议使用以下命令'而不实际调用 run_bash\n"
-            "4. 只运行必要的命令，避免重复探索\n"
-            "5. 获取到足够信息后，立即生成最终答案\n"
-            "6. 最终答案应包含实际执行命令的完整输出结果\n\n"
-            "【反幻觉规则 — 最高优先级】\n"
-            "1. 所有输出必须严格基于 run_bash 的实际执行结果\n"
+            "你是一个任务执行 Agent，通过调用可用工具来实际完成任务。\n\n"
+            "【执行规则 — 最高优先级】\n"
+            "1. 必须通过可用工具实际执行操作，禁止只提供方案或示例而不调用工具\n"
+            "2. 禁止只解释如何操作而不实际调用工具\n"
+            "3. 禁止说'我无法执行'或'建议使用以下方式'而不实际尝试调用工具\n"
+            "4. 禁止在回复中直接输出代码或命令文本作为结果——必须通过工具实际执行，"
+            "让工具返回真实结果\n"
+            "5. 只执行必要的操作，避免重复探索\n"
+            "6. 获取到足够信息后，立即生成最终答案\n"
+            "7. 最终答案应包含工具实际执行后的真实输出结果\n\n"
+            "【反幻觉规则】\n"
+            "1. 所有输出必须严格基于工具的实际执行结果\n"
             "2. 禁止凭推断、猜测、记忆或语义分析生成任何事实性内容\n"
             "3. 如果无法获取所需资源，必须立即停止并报告失败原因\n"
             "4. 禁止在无法访问实际数据的情况下生成报告或分析\n"
             "5. 宁可报告任务未完成，也不要生成基于猜测的虚假结果\n\n"
             "【文件输出】\n"
             "- 生成的文件保存到 /data 目录\n"
-            "- 在最终回答中列出保存的文件路径，并包含内容摘要\n"
-            "- 不需要用 cat 回显完整文件内容，评判系统会自动读取已保存的文件\n\n"
+            "- 在最终回答中列出保存的文件路径，并包含内容摘要\n\n"
             "【信息检索】\n"
-            "- 使用 grep -n '关键词' /data/upstream/*.md 检索前序任务输出中的关键信息\n"
-            "- 使用 cat /data/upstream/task_N.md 读取完整的前序任务输出\n"
+            "- 前序任务的输出保存在 /data/upstream/ 目录下的文件中\n"
+            "- 使用工具读取这些文件以获取前序任务的结果\n"
             "- 按需检索，不要一次性读取所有文件\n\n"
             "【规划执行】\n"
             "- 你会收到一个执行计划，必须按计划逐步执行\n"
             "- 每完成一步，报告该步骤的直接结果\n"
             "- 如果某步失败，记录失败原因后继续下一步\n"
+            "- 每个步骤都必须通过工具实际执行，不能只输出代码或命令文本\n"
         )
+        if assistant_mode:
+            msg += (
+                "\n【请求补充信息】\n"
+                "- 如果任务所需的关键信息缺失或不确定，使用 ask_assistant 工具向助手请求补充信息\n"
+                "- 例如：任务目标不明确、缺少必要的配置参数、需要用户确认等场景\n"
+                "- 不要在信息不足时编造数据或猜测——先请求补充信息\n"
+            )
         if server_id:
             msg += f"\n【执行环境】服务器 ID：`{server_id}`"
         if upstream_files:
-            msg += "\n\n【前序任务输出文件】\n使用 grep/cat 按需检索：\n"
+            msg += "\n\n【前序任务输出文件】\n使用工具按需检索：\n"
             msg += "\n".join(f"- {p}" for p in upstream_files)
         return msg
 
@@ -656,7 +666,8 @@ class ExecutionAgent(BaseAgent):
         tools = self._build_tool_registry(task_id, "")
         tool_defs = tools.to_openai_tools()
 
-        system_msg = self._build_exec_system_msg(upstream_files, server_id)
+        system_msg = self._build_exec_system_msg(
+            upstream_files, server_id, assistant_mode=self._assistant_mode)
         system_msg += f"\n\n【当前角色】\n{self.system_prompt}"
 
         step_results = []
@@ -672,7 +683,9 @@ class ExecutionAgent(BaseAgent):
                 + "\n".join(f"  {s['id']}: {s['description']}" for s in plan)
                 + f"\n\n【当前步骤 — {step_id}】\n{step_desc}\n\n"
                 f"【工程约束】\n{ENGINEERING_CONSTRAINTS}\n"
-                f"请执行当前步骤。完成后报告该步骤的直接结果。"
+                f"请立即使用可用工具执行当前步骤。"
+                f"禁止在回复中直接输出代码或命令文本——必须通过工具实际执行并获取真实结果。"
+                f"完成后报告该步骤的实际执行结果。"
             )
 
             messages: List[Dict[str, Any]] = [

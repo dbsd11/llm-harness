@@ -492,6 +492,20 @@ class WebSocketServer:
         correlation = self.ask_assistant_correlations.pop(tid, None)
         if correlation:
             await self._route_ask_assistant_response(tid, result, correlation)
+            # Finalize the ask_task in DB so it doesn't stay in "started" state
+            try:
+                task_repo_inst = self.__class__._get_task_repo()
+                ask_task = await run_in_db_thread(
+                    task_repo_inst.find_by_task_id, tid)
+                if ask_task:
+                    agent_role = (result or {}).get("role") or "assistant"
+                    await run_in_db_thread(lambda: finalize_task(
+                        ask_task.scenario_id, tid, result,
+                        agent_name=f"Assistant:{correlation.get('requesting_server_id', '')}",
+                        agent_role=agent_role,
+                    ))
+            except Exception as e:
+                logger.warning(f"Failed to finalize ask_task {tid}: {e}")
             return
 
         # Resolve in-flight future (from forward_task)
@@ -532,6 +546,7 @@ class WebSocketServer:
         p = frame.get("payload", {})
         request_id = p.get("request_id", "")
         question = p.get("question", "")
+        context_summary = p.get("context_summary", "")
         task_id = frame.get("task_id", "")
 
         logger.info(f"ask_assistant_request from {requesting_server_id}: "
@@ -585,11 +600,15 @@ class WebSocketServer:
             return
 
         ask_task_id = f"ask_{request_id[:8]}"
+        ask_goal = f"请回答以下问题：{question}"
+        if context_summary:
+            ask_goal = f"【背景】{context_summary}\n\n{ask_goal}"
         ask_ctx = {
             "role": assistant_role or "assistant",
             "system_prompt": assistant_sys_prompt or "You are a helpful assistant.",
             "server_id": assistant_server_id,
             "question": question,
+            "context_summary": context_summary,
             "task_type": "direct_execute",
         }
 
@@ -609,7 +628,7 @@ class WebSocketServer:
                 scenario_id=scenario_id,
                 idempotency_key=f"{task_id}:ask_assistant_{request_id[:8]}",
                 depends_on=None,
-                goal=f"请回答以下问题：{question}",
+                goal=ask_goal,
                 state="pending",
                 priority=0,
                 timeout_seconds=300,
@@ -635,7 +654,7 @@ class WebSocketServer:
         ask_msg = TaskMessage(
             task_id=ask_task_id,
             parent_task_id=task_id,
-            goal=f"请回答以下问题：{question}",
+            goal=ask_goal,
             context=ask_ctx,
         )
 
@@ -673,6 +692,12 @@ class WebSocketServer:
             await conn.ws.send_str(response_frame)
             logger.info(f"Routed ask_assistant response to {requesting_server_id} "
                         f"(request_id={request_id})")
+            # Broadcast to /subscribe subscribers for monitoring visibility
+            await self._broadcast_event("task_result", {
+                "task_id": task_id,
+                "success": success,
+                "output": answer,
+            })
         except Exception as e:
             logger.error(f"Failed to send ask_assistant response: {e}")
 

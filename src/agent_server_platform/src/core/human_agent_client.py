@@ -32,7 +32,7 @@ class HumanAgentClient:
         else:
             from core.local_tenant import get_tenant_id
             tid = get_tenant_id()
-            self._server_id = f"human-{tid}" if tid else "human-1"
+            self._server_id = f"human-{tid}" if tid else "human-test"
         self._total_quota = int(os.getenv("HUMAN_AGENT_QUOTA", "8"))
         # Agent connection uses root path (not /subscribe)
         self._ws_url = os.getenv("WS_SERVER_WS_URL", "wss://agent-socket-server.bdzz.com.cn:8765")
